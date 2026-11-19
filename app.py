@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+from collections import Counter
 
 import streamlit as st
 from docx import Document
@@ -45,9 +46,10 @@ Format:
 {"commands": [ {"action": "...", ...}, ... ]}
 
 "target" object (used by set_alignment, set_font, set_paragraph_format):
-  {"type": "all" | "headings" | "body" | "paragraphs" | "contains",
+  {"type": "all" | "headings" | "body" | "paragraphs" | "contains" | "style",
    "indexes": [1, 2, -1],      // only for "paragraphs": 1-based, negative = from the end
-   "text": "substring"}        // only for "contains"
+   "text": "substring",        // only for "contains"
+   "name": "Heading 1"}        // only for "style": exact paragraph style name
 If the user does not specify which text, use {"type": "all"}.
 "headings" = paragraphs with Heading/Title styles, "body" = all other non-empty paragraphs.
 
@@ -67,6 +69,7 @@ Available actions (include only the fields that need to change):
    for the current page number and {NUMPAGES} for the total, e.g. "Page {PAGE} of {NUMPAGES}".
 7. set_margins: {"action":"set_margins","top_cm":2,"bottom_cm":2,"left_cm":3,"right_cm":1.5}
 8. set_orientation: {"action":"set_orientation","orientation":"portrait|landscape"}
+9. set_page_size: {"action":"set_page_size","width_cm":21,"height_cm":29.7}  (A4 portrait; A4 landscape is 29.7 x 21)
 
 Rules:
 - Use real numbers and booleans, not strings.
@@ -204,6 +207,9 @@ def select_paragraphs(doc: Document, target: dict | None) -> list:
     if kind == "contains":
         needle = str(target.get("text", "")).lower()
         return [p for p in paragraphs if needle and needle in p.text.lower()]
+    if kind == "style":
+        name = str(target.get("name", "")).lower()
+        return [p for p in paragraphs if p.style.name.lower() == name]
     if kind == "paragraphs":
         body = doc.paragraphs
         chosen = []
@@ -370,6 +376,237 @@ def cmd_set_orientation(doc, cmd):
     return "ориентация: " + ("альбомная" if landscape else "книжная")
 
 
+# ---------------------------------------------------------------------------
+# 3.1 ФОРМАТИРОВАНИЕ ПО ОБРАЗЦУ
+# Идея: «читаем» оформление документа-образца и превращаем его в ТЕ ЖЕ JSON-команды,
+# которые раньше давал Gemini. Дальше работает уже знакомый apply_commands().
+# ---------------------------------------------------------------------------
+ALIGN_NAMES = {value: name for name, value in ALIGNMENTS.items()}
+
+
+def docdefault(doc: Document, xpath: str):
+    """Значение из «настроек по умолчанию» документа (w:docDefaults в styles.xml)."""
+    values = doc.styles.element.xpath(xpath)
+    return str(values[0]) if values else None
+
+
+def _font_value(font, attr: str):
+    return font.color.rgb if attr == "color" else getattr(font, attr)
+
+
+def resolve_font_attr(doc: Document, run, paragraph, attr: str):
+    """
+    Настоящее значение свойства шрифта. В Word оно часто не записано в самом тексте,
+    а наследуется: run -> стиль абзаца -> родительские стили -> настройки по умолчанию.
+    """
+    value = _font_value(run.font, attr)
+    if value is not None:
+        return value
+    style = paragraph.style
+    while style is not None:
+        value = _font_value(style.font, attr)
+        if value is not None:
+            return value
+        style = style.base_style
+    if attr == "name":
+        return docdefault(doc, "w:docDefaults/w:rPrDefault/w:rPr/w:rFonts/@w:ascii")
+    if attr == "size":
+        half_points = docdefault(doc, "w:docDefaults/w:rPrDefault/w:rPr/w:sz/@w:val")
+        return Pt(int(half_points) / 2) if half_points else None
+    return None
+
+
+def resolve_pf(paragraph, attr: str):
+    """То же наследование, но для свойств абзаца (выравнивание, интервалы, отступы)."""
+    value = getattr(paragraph.paragraph_format, attr)
+    if value is not None:
+        return value
+    style = paragraph.style
+    while style is not None:
+        value = getattr(style.paragraph_format, attr)
+        if value is not None:
+            return value
+        style = style.base_style
+    return None
+
+
+def dominant_format(doc: Document, paragraphs: list) -> dict:
+    """
+    Находит «самое типичное» оформление группы абзацев: у каждого свойства выбирается
+    значение, которое покрывает больше всего символов текста.
+    """
+    font_counts = {key: Counter() for key in ("name", "size_pt", "bold", "italic", "color")}
+    para_keys = ("align", "line_spacing", "space_before_pt", "space_after_pt", "first_line_indent_cm")
+    para_counts = {key: Counter() for key in para_keys}
+
+    for p in paragraphs:
+        weight = len(p.text.strip())
+        if not weight:
+            continue
+        for run in p.runs:
+            w = len(run.text.strip())
+            if not w:
+                continue
+            name = resolve_font_attr(doc, run, p, "name")
+            if name:
+                font_counts["name"][str(name)] += w
+            size = resolve_font_attr(doc, run, p, "size")
+            if size is not None:
+                font_counts["size_pt"][round(size.pt * 2) / 2] += w
+            font_counts["bold"][bool(resolve_font_attr(doc, run, p, "bold"))] += w
+            font_counts["italic"][bool(resolve_font_attr(doc, run, p, "italic"))] += w
+            color = resolve_font_attr(doc, run, p, "color")
+            if color is not None:
+                font_counts["color"][str(color)] += w
+
+        para_counts["align"][ALIGN_NAMES.get(resolve_pf(p, "alignment"), "left")] += weight
+        spacing = resolve_pf(p, "line_spacing")
+        if isinstance(spacing, float):  # float = множитель (1.5), иначе точное значение в пунктах
+            para_counts["line_spacing"][round(spacing, 2)] += weight
+        for key, attr, unit in (("space_before_pt", "space_before", "pt"),
+                                ("space_after_pt", "space_after", "pt"),
+                                ("first_line_indent_cm", "first_line_indent", "cm")):
+            value = resolve_pf(p, attr)
+            if value is not None:
+                para_counts[key][round(getattr(value, unit), 2)] += weight
+
+    def top(counter):
+        return counter.most_common(1)[0][0] if counter else None
+
+    result = {key: top(counter) for key, counter in font_counts.items()}
+    result.update({key: top(counter) for key, counter in para_counts.items()})
+    return result
+
+
+def commands_from_format(fmt: dict, target: dict) -> list[dict]:
+    """Превращает найденное оформление в JSON-команды для заданной группы абзацев."""
+    commands = []
+    font = {"action": "set_font", "target": target}
+    for key in ("name", "size_pt", "bold", "italic", "color"):
+        if fmt[key] is not None:
+            font[key] = fmt[key]
+    if len(font) > 2:
+        commands.append(font)
+    if fmt["align"]:
+        commands.append({"action": "set_alignment", "target": target, "align": fmt["align"]})
+    para = {"action": "set_paragraph_format", "target": target}
+    for key in ("line_spacing", "space_before_pt", "space_after_pt", "first_line_indent_cm"):
+        if fmt[key] is not None:
+            para[key] = fmt[key]
+    if len(para) > 2:
+        commands.append(para)
+    return commands
+
+
+def field_placeholder(instruction: str) -> str:
+    instruction = instruction.upper()
+    if "NUMPAGES" in instruction:  # проверяем первым: слово NUMPAGES содержит PAGE
+        return "{NUMPAGES}"
+    if "PAGE" in instruction:
+        return "{PAGE}"
+    return ""
+
+
+def paragraph_text_with_fields(paragraph) -> str:
+    """Текст абзаца, где поля номера страницы заменены на {PAGE} / {NUMPAGES}."""
+    parts, skip, in_result = [], set(), False
+    for el in paragraph._p.iter():
+        if el in skip:
+            continue
+        if el.tag == qn("w:fldSimple"):  # простое поле одним тегом
+            parts.append(field_placeholder(el.get(qn("w:instr")) or ""))
+            skip.update(el.iter(qn("w:t")))
+        elif el.tag == qn("w:fldChar"):  # сложное поле: begin ... separate ... end
+            kind = el.get(qn("w:fldCharType"))
+            if kind == "separate":
+                in_result = True  # дальше идёт сохранённый результат (например «1») — пропускаем
+            elif kind == "end":
+                in_result = False
+        elif el.tag == qn("w:instrText"):
+            parts.append(field_placeholder(el.text or ""))
+        elif el.tag == qn("w:t") and not in_result:
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def header_footer_command(example: Document, action: str, container, copy_text: bool):
+    if container.is_linked_to_previous:  # в образце такого колонтитула нет
+        return None
+    for p in container.paragraphs:
+        text = paragraph_text_with_fields(p).strip()
+        if not text:
+            continue
+        has_page_number = "{PAGE}" in text or "{NUMPAGES}" in text
+        if not has_page_number and not copy_text:
+            return None  # обычный текст колонтитула не копируем, если пользователь не просил
+        fmt = dominant_format(example, [p])
+        cmd = {"action": action, "text": text, "align": fmt["align"] or "left"}
+        for key in ("name", "size_pt", "bold", "italic", "color"):
+            if fmt[key] is not None:
+                cmd[key] = fmt[key]
+        return cmd
+    return None
+
+
+def extract_format_commands(example: Document, target: Document, copy_hf_text: bool = True) -> list[dict]:
+    """Главная функция: документ-образец -> список JSON-команд."""
+    commands = []
+    section = example.sections[0]
+
+    # Страница: размер и поля
+    if section.page_width and section.page_height:
+        commands.append({"action": "set_page_size",
+                         "width_cm": round(section.page_width.cm, 2),
+                         "height_cm": round(section.page_height.cm, 2)})
+    margins = {}
+    for key, attr in (("top_cm", "top_margin"), ("bottom_cm", "bottom_margin"),
+                      ("left_cm", "left_margin"), ("right_cm", "right_margin")):
+        value = getattr(section, attr)
+        if value is not None:
+            margins[key] = round(value.cm, 2)
+    if margins:
+        commands.append({"action": "set_margins", **margins})
+
+    # Колонки читаем прямо из XML (тег w:cols)
+    count, spacing, line = 1, 1.25, False
+    cols = section._sectPr.find(qn("w:cols"))
+    if cols is not None:
+        count = int(cols.get(qn("w:num"), 1))
+        spacing = round(int(cols.get(qn("w:space"), 708)) / TWIPS_PER_CM, 2)
+        line = cols.get(qn("w:sep")) in ("1", "true", "on")
+    commands.append({"action": "set_columns", "count": count, "spacing_cm": spacing, "line_between": line})
+
+    # Колонтитулы
+    for action, container in (("set_header", section.header), ("set_footer", section.footer)):
+        cmd = header_footer_command(example, action, container, copy_hf_text)
+        if cmd:
+            commands.append(cmd)
+
+    # Основной текст
+    body = [p for p in example.paragraphs if p.text.strip() and not is_heading(p)]
+    commands += commands_from_format(dominant_format(example, body), {"type": "body"})
+
+    # Заголовки: отдельно для каждого стиля (Heading 1, Heading 2...), если он есть в целевом файле
+    target_styles = {p.style.name for p in all_paragraphs(target)}
+    groups: dict[str, list] = {}
+    for p in example.paragraphs:
+        if p.text.strip() and is_heading(p) and p.style.name in target_styles:
+            groups.setdefault(p.style.name, []).append(p)
+    for style_name, paragraphs in groups.items():
+        commands += commands_from_format(
+            dominant_format(example, paragraphs), {"type": "style", "name": style_name}
+        )
+    return commands
+
+
+def cmd_set_page_size(doc, cmd):
+    width, height = Cm(float(cmd["width_cm"])), Cm(float(cmd["height_cm"]))
+    for section in doc.sections:
+        section.page_width, section.page_height = width, height
+        section.orientation = WD_ORIENT.LANDSCAPE if width > height else WD_ORIENT.PORTRAIT
+    return f"размер страницы {cmd['width_cm']}×{cmd['height_cm']} см"
+
+
 # Словарь «название действия -> функция». Новая команда = новая функция + строка тут.
 ACTIONS = {
     "set_alignment": cmd_set_alignment,
@@ -380,6 +617,7 @@ ACTIONS = {
     "set_footer": cmd_set_footer,
     "set_margins": cmd_set_margins,
     "set_orientation": cmd_set_orientation,
+    "set_page_size": cmd_set_page_size,
 }
 
 
@@ -403,31 +641,44 @@ def apply_commands(doc: Document, commands: list[dict]) -> list[str]:
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Word-форматтер на ИИ", page_icon="📝")
 st.title("📝 Форматирование Word с помощью ИИ")
-st.caption("Загрузите .docx, опишите словами, что изменить, — и скачайте результат.")
+st.caption("Опишите словами, что изменить, и/или загрузите образец — документ, оформление которого нужно повторить.")
 
 with st.sidebar:
     st.header("Настройки")
     typed_key = st.text_input("Gemini API-ключ", type="password",
-                              help="Необязательно, если ключ задан в переменной окружения GEMINI_API_KEY")
+                              help="Нужен только для текстовых запросов. Форматирование по образцу работает без ключа.")
+    copy_hf_text = st.checkbox(
+        "Копировать текст колонтитулов из образца",
+        value=True,
+        help="Если выключить, из образца будут скопированы только колонтитулы с номерами страниц, "
+             "а обычный текст в колонтитулах (фамилия, название работы) — нет.",
+    )
     st.markdown(f"Модель: `{MODEL_NAME}`")
 
 api_key = typed_key or get_api_key()
 
-uploaded = st.file_uploader("1. Загрузите файл Word", type=["docx"])
+uploaded = st.file_uploader("1. Загрузите файл Word, который нужно изменить", type=["docx"], key="target")
+example_file = st.file_uploader(
+    "2. (Необязательно) Загрузите образец оформления", type=["docx"], key="example",
+    help="Из образца будут взяты: размер страницы, поля, колонки, колонтитулы, шрифты, "
+         "выравнивание, интервалы и оформление заголовков.",
+)
 user_prompt = st.text_area(
-    "2. Что нужно сделать с документом?",
+    "3. Что нужно сделать с документом? (необязательно, если загружен образец)",
     placeholder="Например: сделай текст в две колонки, шрифт Times New Roman 14, "
-                "выравнивание по ширине, заголовки по центру, внизу номер страницы",
+                "выравнивание по ширине, заголовки по центру, внизу номер страницы. "
+                "Если загружен образец, этот запрос применится после него и может что-то уточнить.",
     height=120,
 )
 
 if st.button("Применить форматирование", type="primary"):
-    if not api_key:
+    has_prompt = bool(user_prompt.strip())
+    if uploaded is None:
+        st.warning("Сначала загрузите .docx-файл, который нужно изменить.")
+    elif not has_prompt and example_file is None:
+        st.warning("Загрузите образец или напишите, что нужно изменить.")
+    elif has_prompt and not api_key:
         st.error("Не найден API-ключ Gemini. Введите его в боковой панели или задайте GEMINI_API_KEY.")
-    elif uploaded is None:
-        st.warning("Сначала загрузите .docx-файл.")
-    elif not user_prompt.strip():
-        st.warning("Напишите, что нужно изменить.")
     else:
         try:
             doc = Document(io.BytesIO(uploaded.getvalue()))
@@ -435,15 +686,30 @@ if st.button("Применить форматирование", type="primary"):
             st.error(f"Не удалось открыть файл (он точно .docx?): {exc}")
             st.stop()
 
-        try:
-            with st.spinner("Gemini формирует команды (при перегрузке сервера может занять до минуты)..."):
-                commands, used_model = ask_gemini(api_key, user_prompt, build_outline(doc))
-        except Exception as exc:
-            st.error(f"Ошибка при обращении к Gemini: {exc}")
-            st.stop()
+        # Шаг 1: оформление из образца (без ИИ, чисто Python)
+        example_commands = []
+        if example_file is not None:
+            try:
+                example_doc = Document(io.BytesIO(example_file.getvalue()))
+                example_commands = extract_format_commands(example_doc, doc, copy_hf_text)
+            except Exception as exc:
+                st.error(f"Не удалось прочитать образец: {exc}")
+                st.stop()
 
+        # Шаг 2: текстовый запрос через Gemini (если он есть)
+        prompt_commands, used_model = [], None
+        if has_prompt:
+            try:
+                with st.spinner("Gemini формирует команды (при перегрузке сервера может занять до минуты)..."):
+                    prompt_commands, used_model = ask_gemini(api_key, user_prompt, build_outline(doc))
+            except Exception as exc:
+                st.error(f"Ошибка при обращении к Gemini: {exc}")
+                st.stop()
+
+        # Сначала образец, потом запрос пользователя: запрос может уточнить или переопределить образец
+        commands = example_commands + prompt_commands
         if not commands:
-            st.warning("Модель не нашла подходящих команд. Попробуйте переформулировать запрос.")
+            st.warning("Не нашлось подходящих команд. Попробуйте переформулировать запрос.")
             st.session_state.pop("result", None)
         else:
             log = apply_commands(doc, commands)
@@ -452,7 +718,8 @@ if st.button("Применить форматирование", type="primary"):
             st.session_state["result"] = {
                 "data": buffer.getvalue(),
                 "name": f"formatted_{uploaded.name}",
-                "commands": commands,
+                "example_commands": example_commands,
+                "prompt_commands": prompt_commands,
                 "model": used_model,
                 "log": log,
             }
@@ -461,7 +728,10 @@ if st.button("Применить форматирование", type="primary"):
 result = st.session_state.get("result")
 if result:
     st.success("Готово! Документ обработан.")
-    st.caption(f"Ответила модель: `{result['model']}`")
+    st.caption(
+        f"Ответила модель: `{result['model']}`" if result["model"]
+        else "Текстовый запрос не использовался — ИИ не вызывался."
+    )
     st.download_button(
         "⬇️ Скачать изменённый файл",
         data=result["data"],
@@ -471,5 +741,9 @@ if result:
     with st.expander("Что было сделано"):
         for line in result["log"]:
             st.write(line)
-    with st.expander("JSON-команды от Gemini"):
-        st.json(result["commands"])
+    if result["example_commands"]:
+        with st.expander("Команды, извлечённые из образца"):
+            st.json(result["example_commands"])
+    if result["prompt_commands"]:
+        with st.expander("JSON-команды от Gemini"):
+            st.json(result["prompt_commands"])
