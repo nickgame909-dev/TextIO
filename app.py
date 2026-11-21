@@ -16,9 +16,14 @@ from collections import Counter
 import streamlit as st
 from docx import Document
 from docx.enum.section import WD_ORIENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
-from docx.oxml.ns import qn
+from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+from docx.opc.constants import CONTENT_TYPE as CT, RELATIONSHIP_TYPE as RT
+from docx.opc.packuri import PackURI
+from docx.oxml import OxmlElement, parse_xml
+from docx.oxml.ns import nsdecls, qn
+from docx.parts.numbering import NumberingPart
 from docx.shared import Cm, Pt, RGBColor
 from google import genai
 from google.genai import errors, types
@@ -45,7 +50,7 @@ no explanations, no markdown fences.
 Format:
 {"commands": [ {"action": "...", ...}, ... ]}
 
-"target" object (used by set_alignment, set_font, set_paragraph_format):
+"target" object (used by set_alignment, set_font, set_paragraph_format, set_list, insert_page_break):
   {"type": "all" | "headings" | "body" | "paragraphs" | "contains" | "style",
    "indexes": [1, 2, -1],      // only for "paragraphs": 1-based, negative = from the end
    "text": "substring",        // only for "contains"
@@ -70,6 +75,24 @@ Available actions (include only the fields that need to change):
 7. set_margins: {"action":"set_margins","top_cm":2,"bottom_cm":2,"left_cm":3,"right_cm":1.5}
 8. set_orientation: {"action":"set_orientation","orientation":"portrait|landscape"}
 9. set_page_size: {"action":"set_page_size","width_cm":21,"height_cm":29.7}  (A4 portrait; A4 landscape is 29.7 x 21)
+10. set_list: {"action":"set_list","target":{...},"list_type":"bullet|numbered|none"}
+11. set_table: {"action":"set_table","tables":"all","borders":true,"header_bold":true,
+    "header_fill":"D9D9D9","header_repeat":true,"table_align":"left|center|right",
+    "cell_align":"left|center|right|justify","name":"Arial","size_pt":11}
+    ("tables": "all" or a list of 1-based table numbers)
+12. insert_page_break: {"action":"insert_page_break","target":{...},"where":"before|after"}
+13. insert_toc: {"action":"insert_toc","title":"Оглавление","levels":3,
+    "position":"start|end","after_paragraph":2,"page_break_after":true}
+14. replace_text: {"action":"replace_text","find":"old","replace":"new",
+    "case_sensitive":false,"scope":"body|all"}  (scope "all" also searches headers/footers)
+15. set_first_page: {"action":"set_first_page","different":true,"header_text":"","footer_text":""}
+    Title page without a page number = set_footer with {PAGE} AND set_first_page with different=true.
+16. set_style: {"action":"set_style","style":"Normal","name":"Times New Roman","size_pt":14,
+    "bold":false,"color":"000000","align":"justify","line_spacing":1.5,"space_before_pt":0,
+    "space_after_pt":0,"first_line_indent_cm":1.25,"left_indent_cm":0}
+    Changes a paragraph style itself ("Normal" = body text, "Heading 1", "Title"...).
+    Prefer it over set_font/set_paragraph_format when the user mentions styles or wants
+    the whole document formatted consistently.
 
 Rules:
 - Use real numbers and booleans, not strings.
@@ -122,7 +145,8 @@ def build_outline(doc: Document, limit: int = 40) -> str:
         if len(lines) >= limit:
             lines.append("... (документ продолжается)")
             break
-    return "\n".join(lines) or "(документ пустой)"
+    header = f"Tables in document: {len(doc.tables)}\n"
+    return header + ("\n".join(lines) or "(документ пустой)")
 
 
 def parse_commands(raw: str) -> list[dict]:
@@ -300,8 +324,8 @@ def cmd_set_columns(doc, cmd):
     return f"колонок: {count}"
 
 
-def add_field(paragraph, instruction: str):
-    """Вставляет поле Word (PAGE, NUMPAGES) — номер страницы обновляется сам."""
+def add_field(paragraph, instruction: str, placeholder_text: str = "1"):
+    """Вставляет поле Word (PAGE, NUMPAGES, TOC) — номер страницы обновляется сам."""
     run = paragraph.add_run()
     begin = OxmlElement("w:fldChar")
     begin.set(qn("w:fldCharType"), "begin")
@@ -311,7 +335,7 @@ def add_field(paragraph, instruction: str):
     separate = OxmlElement("w:fldChar")
     separate.set(qn("w:fldCharType"), "separate")
     placeholder = OxmlElement("w:t")
-    placeholder.text = "1"
+    placeholder.text = placeholder_text
     end = OxmlElement("w:fldChar")
     end.set(qn("w:fldCharType"), "end")
     run._r.extend([begin, instr, separate, placeholder, end])
@@ -607,6 +631,417 @@ def cmd_set_page_size(doc, cmd):
     return f"размер страницы {cmd['width_cm']}×{cmd['height_cm']} см"
 
 
+# ---------------------------------------------------------------------------
+# 3.3 НОВЫЕ КОМАНДЫ: списки, таблицы, разрывы страниц, оглавление,
+#     замена текста, колонтитулы первой страницы, стили
+# ---------------------------------------------------------------------------
+def insert_before_any(parent, new_el, successor_tags: list[str]) -> None:
+    """
+    Вставляет new_el перед первым найденным элементом из successor_tags.
+    Word строго следит за порядком тегов внутри XML, поэтому просто append() часто ломает файл.
+    """
+    for tag in successor_tags:
+        el = parent.find(qn(tag))
+        if el is not None:
+            el.addprevious(new_el)
+            return
+    parent.append(new_el)
+
+
+# ----- 1. Списки (нумерованные и маркированные) -----------------------------
+def numbering_element(doc: Document):
+    """XML-корень numbering.xml. Если в документе такой части нет, создаём пустую."""
+    try:
+        return doc.part.numbering_part.element
+    except (KeyError, NotImplementedError):
+        pass
+    part = NumberingPart.load(
+        partname=PackURI("/word/numbering.xml"),
+        content_type=CT.WML_NUMBERING,
+        package=doc.part.package,
+        blob=f"<w:numbering {nsdecls('w')}/>".encode(),
+    )
+    doc.part.relate_to(part, RT.NUMBERING)
+    return part.element
+
+
+def new_list_definition(doc: Document, kind: str) -> int:
+    """Создаёт определение списка и возвращает numId (у каждой команды свой: нумерация с единицы)."""
+    numbering = numbering_element(doc)
+    abstract_ids = [int(e.get(qn("w:abstractNumId"))) for e in numbering.findall(qn("w:abstractNum"))]
+    num_ids = [int(e.get(qn("w:numId"))) for e in numbering.findall(qn("w:num"))]
+    abstract_id = max(abstract_ids, default=0) + 1
+    num_id = max(num_ids, default=0) + 1
+    fmt, text = ("bullet", "•") if kind == "bullet" else ("decimal", "%1.")
+    abstract = parse_xml(
+        f'<w:abstractNum {nsdecls("w")} w:abstractNumId="{abstract_id}">'
+        f'<w:multiLevelType w:val="hybridMultilevel"/>'
+        f'<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="{fmt}"/>'
+        f'<w:lvlText w:val="{text}"/><w:lvlJc w:val="left"/>'
+        f'<w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>'
+        f'</w:abstractNum>'
+    )
+    # по схеме все abstractNum идут раньше всех num
+    insert_before_any(numbering, abstract, ["w:num"])
+    numbering.append(parse_xml(
+        f'<w:num {nsdecls("w")} w:numId="{num_id}"><w:abstractNumId w:val="{abstract_id}"/></w:num>'
+    ))
+    return num_id
+
+
+def cmd_set_list(doc, cmd):
+    kind = str(cmd.get("list_type", "bullet")).lower()
+    if kind not in ("bullet", "numbered", "none"):
+        raise ValueError(f"неизвестный тип списка: {kind}")
+    paragraphs = [p for p in select_paragraphs(doc, cmd.get("target")) if p.text.strip()]
+    if kind == "none":
+        for p in paragraphs:
+            pPr = p._p.pPr
+            if pPr is not None and pPr.numPr is not None:
+                pPr.remove(pPr.numPr)
+        return f"список убран у {len(paragraphs)} абз."
+    num_id = new_list_definition(doc, kind)
+    for p in paragraphs:
+        numPr = p._p.get_or_add_pPr().get_or_add_numPr()
+        numPr.get_or_add_ilvl().val = 0
+        numPr.get_or_add_numId().val = num_id
+        p.paragraph_format.first_line_indent = None  # красная строка мешала бы отступу списка
+        p.paragraph_format.left_indent = None
+    return f"{'нумерованный' if kind == 'numbered' else 'маркированный'} список: {len(paragraphs)} пункт(ов)"
+
+
+# ----- 2. Таблицы -----------------------------------------------------------
+def unique_cells(cells) -> list:
+    """Объединённые ячейки python-docx возвращает несколько раз; оставляем по одной."""
+    seen, result = set(), []
+    for cell in cells:
+        if cell._tc not in seen:
+            seen.add(cell._tc)
+            result.append(cell)
+    return result
+
+
+def set_table_borders(table, on: bool) -> None:
+    tblPr = table._tbl.tblPr
+    for old in tblPr.findall(qn("w:tblBorders")):
+        tblPr.remove(old)
+    borders = OxmlElement("w:tblBorders")
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = OxmlElement(f"w:{side}")
+        el.set(qn("w:val"), "single" if on else "nil")
+        if on:
+            el.set(qn("w:sz"), "4")
+            el.set(qn("w:space"), "0")
+            el.set(qn("w:color"), "auto")
+        borders.append(el)
+    insert_before_any(tblPr, borders, ["w:shd", "w:tblLayout", "w:tblCellMar",
+                                       "w:tblLook", "w:tblCaption", "w:tblDescription"])
+
+
+def shade_cell(cell, fill_hex: str) -> None:
+    tcPr = cell._tc.get_or_add_tcPr()
+    for old in tcPr.findall(qn("w:shd")):
+        tcPr.remove(old)
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill_hex.upper())
+    insert_before_any(tcPr, shd, ["w:noWrap", "w:tcMar", "w:textDirection",
+                                  "w:tcFitText", "w:vAlign", "w:hideMark"])
+
+
+def cmd_set_table(doc, cmd):
+    tables = doc.tables
+    if not tables:
+        return "в документе нет таблиц"
+    selection = cmd.get("tables", "all")
+    if selection in (None, "all"):
+        chosen = list(tables)
+    else:
+        indexes = selection if isinstance(selection, list) else [selection]
+        chosen = [tables[int(i) - 1] for i in indexes if 0 < int(i) <= len(tables)]
+
+    has_font = any(cmd.get(k) is not None for k in ("name", "size_pt", "bold", "italic", "underline", "color"))
+    cell_align = ALIGNMENTS.get(str(cmd.get("cell_align", "")).lower())
+    table_align = {"left": WD_TABLE_ALIGNMENT.LEFT, "center": WD_TABLE_ALIGNMENT.CENTER,
+                   "right": WD_TABLE_ALIGNMENT.RIGHT}.get(str(cmd.get("table_align", "")).lower())
+    fill = str(cmd.get("header_fill", "")).lstrip("#")
+
+    for table in chosen:
+        if cmd.get("borders") is not None:
+            set_table_borders(table, bool(cmd["borders"]))
+        if table_align is not None:
+            table.alignment = table_align
+        cells = unique_cells(c for row in table.rows for c in row.cells)
+        for cell in cells:
+            for p in cell.paragraphs:
+                if cell_align is not None:
+                    p.alignment = cell_align
+                if cmd.get("reset_indent", True):  # красная строка в ячейках почти всегда лишняя
+                    p.paragraph_format.first_line_indent = Cm(0)
+                if has_font:
+                    for run in p.runs:
+                        set_run_font(run, cmd)
+        if table.rows:
+            header_cells = unique_cells(table.rows[0].cells)
+            if cmd.get("header_bold") is not None:
+                for cell in header_cells:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.font.bold = bool(cmd["header_bold"])
+            if re.fullmatch(r"[0-9a-fA-F]{6}", fill):
+                for cell in header_cells:
+                    shade_cell(cell, fill)
+            if cmd.get("header_repeat"):  # шапка повторяется на каждой странице
+                trPr = table.rows[0]._tr.get_or_add_trPr()
+                if trPr.find(qn("w:tblHeader")) is None:
+                    trPr.append(OxmlElement("w:tblHeader"))
+    return f"оформлено таблиц: {len(chosen)}"
+
+
+# ----- 3. Разрывы страниц ---------------------------------------------------
+def cmd_insert_page_break(doc, cmd):
+    where = str(cmd.get("where", "before")).lower()
+    body = list(doc.paragraphs)
+    body_ids = {p._p for p in body}
+    # разрыв имеет смысл только для абзацев основного текста (не внутри таблиц)
+    targets = [p for p in select_paragraphs(doc, cmd.get("target")) if p._p in body_ids]
+    count = 0
+    for p in targets:
+        if where == "after":
+            i = next(k for k, q in enumerate(body) if q._p is p._p)
+            if i + 1 < len(body):
+                body[i + 1].paragraph_format.page_break_before = True
+            else:
+                p.add_run().add_break(WD_BREAK.PAGE)
+        else:
+            p.paragraph_format.page_break_before = True
+        count += 1
+    return f"разрыв страницы {'после' if where == 'after' else 'перед'}: {count} абз."
+
+
+# ----- 4. Оглавление --------------------------------------------------------
+SETTINGS_AFTER_UPDATE_FIELDS = [
+    "w:hdrShapeDefaults", "w:footnotePr", "w:endnotePr", "w:compat", "w:docVars", "w:rsids",
+    "w:themeFontLang", "w:clrSchemeMapping", "w:shapeDefaults", "w:decimalSymbol", "w:listSeparator",
+]
+
+
+def request_field_update(doc: Document) -> None:
+    """Просит Word обновить поля (оглавление, номера страниц) при открытии файла."""
+    settings = doc.settings.element
+    if settings.find(qn("w:updateFields")) is None:
+        el = OxmlElement("w:updateFields")
+        el.set(qn("w:val"), "true")
+        insert_before_any(settings, el, SETTINGS_AFTER_UPDATE_FIELDS)
+
+
+def cmd_insert_toc(doc, cmd):
+    levels = min(9, max(1, int(cmd.get("levels", 3))))
+    title = str(cmd.get("title", "Оглавление"))
+    body = list(doc.paragraphs)
+
+    title_p = None
+    if title:
+        title_p = doc.add_paragraph()
+        run = title_p.add_run(title)
+        run.bold = True
+        run.font.size = Pt(16)
+        title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    toc_p = doc.add_paragraph()
+    add_field(toc_p, f'TOC \\o "1-{levels}" \\h \\z \\u',
+              placeholder_text="Оглавление появится после обновления полей (Ctrl+A, затем F9).")
+    new_paragraphs = [p for p in (title_p, toc_p) if p is not None]
+
+    position = str(cmd.get("position", "start")).lower()
+    after = cmd.get("after_paragraph")
+    if body and after is not None and 1 <= int(after) <= len(body):
+        anchor, before = body[int(after) - 1]._p, False
+    elif body and position != "end":
+        anchor, before = body[0]._p, True
+    else:
+        anchor = None  # «в конец»: add_paragraph уже поставил абзацы куда нужно
+    if anchor is not None:
+        for p in (new_paragraphs if before else reversed(new_paragraphs)):
+            anchor.addprevious(p._p) if before else anchor.addnext(p._p)
+
+    if cmd.get("page_break_after"):
+        toc_p.add_run().add_break(WD_BREAK.PAGE)
+    request_field_update(doc)
+    return f"оглавление до уровня {levels} (в Word нажмите «Обновить поле» или F9)"
+
+
+# ----- 5. Замена текста -----------------------------------------------------
+def replace_in_paragraph(paragraph, find: str, repl: str, case_sensitive: bool) -> int:
+    """
+    Замена, которая переживает разбиение текста на несколько run'ов
+    (в Word одно слово часто лежит в 2-3 кусках из-за проверки орфографии и правок).
+    Замена записывается в первый затронутый run, остальные только укорачиваются.
+    """
+    runs = paragraph.runs
+    full = "".join(r.text for r in runs)
+    pattern = re.compile(re.escape(find), 0 if case_sensitive else re.IGNORECASE)
+    matches = list(pattern.finditer(full))
+    for m in reversed(matches):  # с конца, чтобы не сбивались позиции предыдущих совпадений
+        start, end = m.span()
+        pos, first = 0, True
+        for r in runs:
+            text = r.text
+            r_start, r_end = pos, pos + len(text)
+            pos = r_end
+            if not text or r_end <= start or r_start >= end:
+                continue  # пустые run'ы (картинки, поля) не трогаем
+            a, b = max(start, r_start) - r_start, min(end, r_end) - r_start
+            r.text = text[:a] + (repl if first else "") + text[b:]
+            first = False
+    return len(matches)
+
+
+def header_footer_paragraphs(doc: Document) -> list:
+    result = []
+    for s in doc.sections:
+        for part in (s.header, s.footer, s.first_page_header, s.first_page_footer,
+                     s.even_page_header, s.even_page_footer):
+            if not part.is_linked_to_previous:
+                result.extend(part.paragraphs)
+    return result
+
+
+def cmd_replace_text(doc, cmd):
+    find = str(cmd.get("find", ""))
+    if not find:
+        raise ValueError("не указан текст для поиска (find)")
+    repl = str(cmd.get("replace", ""))
+    case = bool(cmd.get("case_sensitive", False))
+    paragraphs = all_paragraphs(doc)
+    if str(cmd.get("scope", "body")).lower() == "all":
+        paragraphs += header_footer_paragraphs(doc)
+    total = sum(replace_in_paragraph(p, find, repl, case) for p in paragraphs)
+    return f"«{find}» → «{repl}»: {total} замен(ы)"
+
+
+# ----- 6. Колонтитулы первой страницы ---------------------------------------
+def cmd_set_first_page(doc, cmd):
+    different = bool(cmd.get("different", True))
+    for section in doc.sections:
+        section.different_first_page_header_footer = different
+        if not different:
+            continue
+        # пустая строка = колонтитул первой страницы пустой (например, титульный лист без номера)
+        for container, key in ((section.first_page_header, "header_text"),
+                               (section.first_page_footer, "footer_text")):
+            fill_header_footer(container, {**cmd, "text": cmd.get(key, "")})
+    if not different:
+        return "одинаковые колонтитулы на всех страницах"
+    return "первая страница с отдельными колонтитулами (по умолчанию пустыми)"
+
+
+# ----- 7. Стили -------------------------------------------------------------
+def find_style(doc: Document, name: str):
+    wanted = str(name).strip().lower()
+    for style in doc.styles:
+        if style.type == WD_STYLE_TYPE.PARAGRAPH and wanted in ((style.name or "").lower(), style.style_id.lower()):
+            return style
+    return None
+
+
+def set_style_font(style, spec: dict) -> None:
+    font = style.font
+    if spec.get("name"):
+        font.name = spec["name"]
+        rfonts = style.element.rPr.rFonts
+        # шрифты темы (asciiTheme и др.) перебивают явное имя, поэтому убираем их
+        for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+            rfonts.attrib.pop(qn(attr), None)
+        rfonts.set(qn("w:eastAsia"), spec["name"])
+        rfonts.set(qn("w:cs"), spec["name"])
+    if spec.get("size_pt"):
+        font.size = Pt(float(spec["size_pt"]))
+    for key in ("bold", "italic", "underline"):
+        if spec.get(key) is not None:
+            setattr(font, key, bool(spec[key]))
+    color = str(spec.get("color", "")).lstrip("#")
+    if re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        font.color.rgb = RGBColor.from_string(color.upper())
+
+
+def clear_direct_formatting(paragraphs: list, spec: dict) -> None:
+    """
+    Убирает «ручное» оформление, которое перебило бы стиль, но только те свойства,
+    которые мы меняем в стиле. Жирный/курсив внутри текста не трогаем.
+    """
+    run_tags = []
+    if spec.get("name"):
+        run_tags.append("w:rFonts")
+    if spec.get("size_pt"):
+        run_tags += ["w:sz", "w:szCs"]
+    if spec.get("color"):
+        run_tags.append("w:color")
+    spacing_drop, indent_drop = [], []
+    if spec.get("line_spacing") is not None:
+        spacing_drop += ["w:line", "w:lineRule"]
+    if spec.get("space_before_pt") is not None:
+        spacing_drop += ["w:before", "w:beforeLines", "w:beforeAutospacing"]
+    if spec.get("space_after_pt") is not None:
+        spacing_drop += ["w:after", "w:afterLines", "w:afterAutospacing"]
+    if spec.get("first_line_indent_cm") is not None:
+        indent_drop += ["w:firstLine", "w:firstLineChars", "w:hanging", "w:hangingChars"]
+    if spec.get("left_indent_cm") is not None:
+        indent_drop += ["w:left", "w:start", "w:leftChars", "w:startChars"]
+
+    for p in paragraphs:
+        for run in p.runs:
+            rPr = run._r.rPr
+            if rPr is not None:
+                for tag in run_tags:
+                    for el in rPr.findall(qn(tag)):
+                        rPr.remove(el)
+        pPr = p._p.pPr
+        if pPr is None:
+            continue
+        if spec.get("align"):
+            for el in pPr.findall(qn("w:jc")):
+                pPr.remove(el)
+        for tag, drop in (("w:spacing", spacing_drop), ("w:ind", indent_drop)):
+            el = pPr.find(qn(tag))
+            if el is not None and drop:
+                for attr in drop:
+                    el.attrib.pop(qn(attr), None)
+                if not el.attrib:
+                    pPr.remove(el)
+
+
+def cmd_set_style(doc, cmd):
+    style = find_style(doc, cmd.get("style", ""))
+    if style is None:
+        available = ", ".join(sorted(s.name for s in doc.styles if s.type == WD_STYLE_TYPE.PARAGRAPH))
+        raise ValueError(f"стиль «{cmd.get('style')}» не найден. Есть: {available}")
+
+    set_style_font(style, cmd)
+    pf = style.paragraph_format
+    align = ALIGNMENTS.get(str(cmd.get("align", "")).lower())
+    if align is not None:
+        pf.alignment = align
+    if cmd.get("line_spacing") is not None:
+        pf.line_spacing = float(cmd["line_spacing"])
+    if cmd.get("space_before_pt") is not None:
+        pf.space_before = Pt(float(cmd["space_before_pt"]))
+    if cmd.get("space_after_pt") is not None:
+        pf.space_after = Pt(float(cmd["space_after_pt"]))
+    if cmd.get("first_line_indent_cm") is not None:
+        pf.first_line_indent = Cm(float(cmd["first_line_indent_cm"]))
+    if cmd.get("left_indent_cm") is not None:
+        pf.left_indent = Cm(float(cmd["left_indent_cm"]))
+
+    cleaned = 0
+    if cmd.get("clear_direct", True):
+        # только основной текст: абзацы в таблицах оформляются командой set_table и не должны сбрасываться
+        users = [p for p in doc.paragraphs if p.style.style_id == style.style_id]
+        clear_direct_formatting(users, cmd)
+        cleaned = len(users)
+    return f"стиль «{style.name}» обновлён (ручное оформление снято в {cleaned} абз.)"
+
+
 # Словарь «название действия -> функция». Новая команда = новая функция + строка тут.
 ACTIONS = {
     "set_alignment": cmd_set_alignment,
@@ -618,6 +1053,13 @@ ACTIONS = {
     "set_margins": cmd_set_margins,
     "set_orientation": cmd_set_orientation,
     "set_page_size": cmd_set_page_size,
+    "set_list": cmd_set_list,
+    "set_table": cmd_set_table,
+    "insert_page_break": cmd_insert_page_break,
+    "insert_toc": cmd_insert_toc,
+    "replace_text": cmd_replace_text,
+    "set_first_page": cmd_set_first_page,
+    "set_style": cmd_set_style,
 }
 
 
@@ -637,113 +1079,263 @@ def apply_commands(doc: Document, commands: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# 4. ИНТЕРФЕЙС STREAMLIT
+# 3.2 ПРЕСЕТЫ: готовые наборы команд, ИИ не нужен
 # ---------------------------------------------------------------------------
+ALL = {"type": "all"}
+BODY = {"type": "body"}
+HEADINGS = {"type": "headings"}
+
+PRESETS = {
+    "🎓 ГОСТ (курсовая)": [
+        {"action": "set_page_size", "width_cm": 21, "height_cm": 29.7},
+        {"action": "set_orientation", "orientation": "portrait"},
+        {"action": "set_margins", "top_cm": 2, "bottom_cm": 2, "left_cm": 3, "right_cm": 1.5},
+        {"action": "set_columns", "count": 1, "spacing_cm": 1.25, "line_between": False},
+        {"action": "set_font", "target": ALL, "name": "Times New Roman", "size_pt": 14, "color": "000000"},
+        {"action": "set_alignment", "target": BODY, "align": "justify"},
+        {"action": "set_paragraph_format", "target": BODY, "line_spacing": 1.5,
+         "space_before_pt": 0, "space_after_pt": 0, "first_line_indent_cm": 1.25},
+        {"action": "set_font", "target": HEADINGS, "bold": True},
+        {"action": "set_alignment", "target": HEADINGS, "align": "center"},
+        {"action": "set_paragraph_format", "target": HEADINGS, "line_spacing": 1.5,
+         "space_before_pt": 0, "space_after_pt": 12, "first_line_indent_cm": 0},
+        {"action": "set_footer", "text": "{PAGE}", "align": "center",
+         "name": "Times New Roman", "size_pt": 12},
+    ],
+    "📰 Статья (2 колонки)": [
+        {"action": "set_page_size", "width_cm": 21, "height_cm": 29.7},
+        {"action": "set_margins", "top_cm": 2, "bottom_cm": 2, "left_cm": 2, "right_cm": 2},
+        {"action": "set_columns", "count": 2, "spacing_cm": 1.0, "line_between": False},
+        {"action": "set_font", "target": ALL, "name": "Times New Roman", "size_pt": 10, "color": "000000"},
+        {"action": "set_alignment", "target": BODY, "align": "justify"},
+        {"action": "set_paragraph_format", "target": BODY, "line_spacing": 1.0,
+         "space_before_pt": 0, "space_after_pt": 0, "first_line_indent_cm": 0.75},
+        {"action": "set_font", "target": HEADINGS, "bold": True},
+        {"action": "set_footer", "text": "{PAGE}", "align": "center", "size_pt": 9},
+    ],
+    "💼 Деловой (Arial 11)": [
+        {"action": "set_page_size", "width_cm": 21, "height_cm": 29.7},
+        {"action": "set_margins", "top_cm": 2, "bottom_cm": 2, "left_cm": 2.5, "right_cm": 1.5},
+        {"action": "set_columns", "count": 1, "spacing_cm": 1.25, "line_between": False},
+        {"action": "set_font", "target": ALL, "name": "Arial", "size_pt": 11, "color": "000000"},
+        {"action": "set_alignment", "target": BODY, "align": "left"},
+        {"action": "set_paragraph_format", "target": BODY, "line_spacing": 1.15,
+         "space_before_pt": 0, "space_after_pt": 6, "first_line_indent_cm": 0},
+        {"action": "set_font", "target": HEADINGS, "bold": True},
+        {"action": "set_alignment", "target": HEADINGS, "align": "left"},
+        {"action": "set_footer", "text": "Страница {PAGE} из {NUMPAGES}", "align": "right",
+         "name": "Arial", "size_pt": 9},
+    ],
+}
+
+PRESETS["🎓 ГОСТ + титул без номера"] = PRESETS["🎓 ГОСТ (курсовая)"] + [
+    {"action": "set_first_page", "different": True, "footer_text": ""},
+]
+
+MAX_HISTORY = 20  # сколько версий документа хранить для отмены
+
+
+# ---------------------------------------------------------------------------
+# 4. ИНТЕРФЕЙС STREAMLIT
+# Состояние в session_state:
+#   history  - список версий документа (байты), последняя = текущая
+#   steps    - подписи версий (для списка «История правок»)
+#   pending_json - команды, ожидающие подтверждения (редактируемый текст)
+# ---------------------------------------------------------------------------
+def init_state():
+    st.session_state.setdefault("history", [])
+    st.session_state.setdefault("steps", [])
+    st.session_state.setdefault("file_key", None)
+    st.session_state.setdefault("pending_label", "")
+
+
+def current_doc() -> Document:
+    return Document(io.BytesIO(st.session_state["history"][-1]))
+
+
+def push_version(doc: Document, label: str) -> None:
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    st.session_state["history"].append(buffer.getvalue())
+    st.session_state["steps"].append(label)
+    if len(st.session_state["history"]) > MAX_HISTORY:  # первую (исходную) версию не трогаем
+        del st.session_state["history"][1]
+        del st.session_state["steps"][1]
+
+
+def run_commands(commands: list[dict], label: str) -> None:
+    doc = current_doc()
+    log = apply_commands(doc, commands)
+    push_version(doc, label)
+    st.session_state["flash"] = ("success", f"Применено: {label}", log)
+
+
+# --- обработчики кнопок (callbacks) ---
+def on_preset(name: str):
+    run_commands(PRESETS[name], name)
+
+
+def on_apply_pending():
+    try:
+        commands = parse_commands(st.session_state.get("pending_json", ""))
+    except Exception as exc:
+        st.session_state["flash"] = ("error", f"Не удалось разобрать JSON: {exc}", [])
+        return
+    if not commands:
+        st.session_state["flash"] = ("warning", "В JSON нет ни одной команды.", [])
+        return
+    run_commands(commands, st.session_state.get("pending_label") or "правка")
+    st.session_state.pop("pending_json", None)
+
+
+def on_discard_pending():
+    st.session_state.pop("pending_json", None)
+
+
+def on_undo():
+    if len(st.session_state["history"]) > 1:
+        st.session_state["history"].pop()
+        removed = st.session_state["steps"].pop()
+        st.session_state["flash"] = ("info", f"Отменено: {removed}", [])
+
+
+def on_reset():
+    del st.session_state["history"][1:]
+    del st.session_state["steps"][1:]
+    st.session_state.pop("pending_json", None)
+    st.session_state["flash"] = ("info", "Документ возвращён к исходному виду.", [])
+
+
+# --- страница ---
 st.set_page_config(page_title="Word-форматтер на ИИ", page_icon="📝")
+init_state()
 st.title("📝 Форматирование Word с помощью ИИ")
-st.caption("Опишите словами, что изменить, и/или загрузите образец — документ, оформление которого нужно повторить.")
+st.caption("Загрузите документ один раз и вносите правки по шагам: пресеты, текстовые запросы, образец. "
+           "Любой шаг можно отменить.")
 
 with st.sidebar:
     st.header("Настройки")
     typed_key = st.text_input("Gemini API-ключ", type="password",
-                              help="Нужен только для текстовых запросов. Форматирование по образцу работает без ключа.")
+                              help="Нужен только для текстовых запросов. Пресеты и образец работают без ключа.")
     copy_hf_text = st.checkbox(
         "Копировать текст колонтитулов из образца",
         value=True,
-        help="Если выключить, из образца будут скопированы только колонтитулы с номерами страниц, "
-             "а обычный текст в колонтитулах (фамилия, название работы) — нет.",
+        help="Если выключить, из образца будут скопированы только колонтитулы с номерами страниц.",
     )
     st.markdown(f"Модель: `{MODEL_NAME}`")
 
 api_key = typed_key or get_api_key()
 
-uploaded = st.file_uploader("1. Загрузите файл Word, который нужно изменить", type=["docx"], key="target")
+uploaded = st.file_uploader("1. Загрузите файл Word", type=["docx"], key="target")
+if uploaded is None:
+    st.info("Загрузите .docx-файл, чтобы начать.")
+    st.stop()
+
+# Новый файл -> начинаем историю заново. Тот же файл -> сохраняем накопленные правки.
+file_key = f"{uploaded.name}:{uploaded.size}"
+if st.session_state["file_key"] != file_key:
+    try:
+        Document(io.BytesIO(uploaded.getvalue()))  # проверка, что файл открывается
+    except Exception as exc:
+        st.error(f"Не удалось открыть файл (он точно .docx?): {exc}")
+        st.stop()
+    st.session_state["history"] = [uploaded.getvalue()]
+    st.session_state["steps"] = ["Исходный файл"]
+    st.session_state["file_key"] = file_key
+    st.session_state.pop("pending_json", None)
+    st.session_state.pop("flash", None)
+
+# Сообщение о результате последнего действия
+flash = st.session_state.pop("flash", None)
+if flash:
+    kind, text, log = flash
+    getattr(st, kind)(text)
+    if log:
+        with st.expander("Что было сделано"):
+            for line in log:
+                st.write(line)
+
+# --- Пресеты ---
+st.subheader("Готовые пресеты")
+preset_cols = st.columns(len(PRESETS))
+for col, name in zip(preset_cols, PRESETS):
+    col.button(name, on_click=on_preset, args=(name,), use_container_width=True)
+
+# --- Образец и текстовый запрос ---
+st.subheader("Свой запрос")
 example_file = st.file_uploader(
-    "2. (Необязательно) Загрузите образец оформления", type=["docx"], key="example",
-    help="Из образца будут взяты: размер страницы, поля, колонки, колонтитулы, шрифты, "
-         "выравнивание, интервалы и оформление заголовков.",
+    "2. (Необязательно) Образец оформления", type=["docx"], key="example",
+    help="Берутся: размер страницы, поля, колонки, колонтитулы, шрифты, выравнивание, интервалы, заголовки.",
 )
 user_prompt = st.text_area(
-    "3. Что нужно сделать с документом? (необязательно, если загружен образец)",
-    placeholder="Например: сделай текст в две колонки, шрифт Times New Roman 14, "
-                "выравнивание по ширине, заголовки по центру, внизу номер страницы. "
-                "Если загружен образец, этот запрос применится после него и может что-то уточнить.",
-    height=120,
+    "3. Что сделать с документом? (необязательно, если загружен образец)",
+    placeholder="Например: заголовки по центру, шрифт Arial 12, интервал 1.5",
+    height=100,
 )
 
-if st.button("Применить форматирование", type="primary"):
+if st.button("Сформировать команды", type="primary"):
     has_prompt = bool(user_prompt.strip())
-    if uploaded is None:
-        st.warning("Сначала загрузите .docx-файл, который нужно изменить.")
-    elif not has_prompt and example_file is None:
+    if not has_prompt and example_file is None:
         st.warning("Загрузите образец или напишите, что нужно изменить.")
     elif has_prompt and not api_key:
         st.error("Не найден API-ключ Gemini. Введите его в боковой панели или задайте GEMINI_API_KEY.")
     else:
-        try:
-            doc = Document(io.BytesIO(uploaded.getvalue()))
-        except Exception as exc:
-            st.error(f"Не удалось открыть файл (он точно .docx?): {exc}")
-            st.stop()
+        doc = current_doc()
+        commands, labels = [], []
 
-        # Шаг 1: оформление из образца (без ИИ, чисто Python)
-        example_commands = []
         if example_file is not None:
             try:
                 example_doc = Document(io.BytesIO(example_file.getvalue()))
-                example_commands = extract_format_commands(example_doc, doc, copy_hf_text)
+                commands += extract_format_commands(example_doc, doc, copy_hf_text)
+                labels.append("образец")
             except Exception as exc:
                 st.error(f"Не удалось прочитать образец: {exc}")
                 st.stop()
 
-        # Шаг 2: текстовый запрос через Gemini (если он есть)
-        prompt_commands, used_model = [], None
         if has_prompt:
             try:
-                with st.spinner("Gemini формирует команды (при перегрузке сервера может занять до минуты)..."):
+                with st.spinner("Gemini формирует команды (при перегрузке может занять до минуты)..."):
                     prompt_commands, used_model = ask_gemini(api_key, user_prompt, build_outline(doc))
+                commands += prompt_commands
+                labels.append(f"запрос «{user_prompt.strip()[:40]}»")
             except Exception as exc:
                 st.error(f"Ошибка при обращении к Gemini: {exc}")
                 st.stop()
 
-        # Сначала образец, потом запрос пользователя: запрос может уточнить или переопределить образец
-        commands = example_commands + prompt_commands
-        if not commands:
-            st.warning("Не нашлось подходящих команд. Попробуйте переформулировать запрос.")
-            st.session_state.pop("result", None)
+        if commands:
+            # Ничего не применяем: сначала показываем команды на проверку
+            st.session_state["pending_json"] = json.dumps(
+                {"commands": commands}, ensure_ascii=False, indent=2
+            )
+            st.session_state["pending_label"] = " + ".join(labels)
         else:
-            log = apply_commands(doc, commands)
-            buffer = io.BytesIO()
-            doc.save(buffer)
-            st.session_state["result"] = {
-                "data": buffer.getvalue(),
-                "name": f"formatted_{uploaded.name}",
-                "example_commands": example_commands,
-                "prompt_commands": prompt_commands,
-                "model": used_model,
-                "log": log,
-            }
+            st.warning("Не нашлось подходящих команд. Попробуйте переформулировать запрос.")
 
-# Результат хранится в session_state, чтобы кнопка скачивания не пропадала после перезапуска страницы
-result = st.session_state.get("result")
-if result:
-    st.success("Готово! Документ обработан.")
-    st.caption(
-        f"Ответила модель: `{result['model']}`" if result["model"]
-        else "Текстовый запрос не использовался — ИИ не вызывался."
-    )
-    st.download_button(
-        "⬇️ Скачать изменённый файл",
-        data=result["data"],
-        file_name=result["name"],
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-    with st.expander("Что было сделано"):
-        for line in result["log"]:
-            st.write(line)
-    if result["example_commands"]:
-        with st.expander("Команды, извлечённые из образца"):
-            st.json(result["example_commands"])
-    if result["prompt_commands"]:
-        with st.expander("JSON-команды от Gemini"):
-            st.json(result["prompt_commands"])
+# --- Проверка команд перед применением ---
+if "pending_json" in st.session_state:
+    st.subheader("Проверьте команды")
+    st.caption("Это то, что будет применено к документу. JSON можно отредактировать вручную.")
+    st.text_area("JSON-команды", key="pending_json", height=320, label_visibility="collapsed")
+    apply_col, discard_col = st.columns(2)
+    apply_col.button("✅ Применить", on_click=on_apply_pending, type="primary", use_container_width=True)
+    discard_col.button("🗑 Отклонить", on_click=on_discard_pending, use_container_width=True)
+
+# --- Результат, отмена и скачивание ---
+st.divider()
+st.subheader("Результат")
+undo_col, reset_col = st.columns(2)
+undo_col.button("↩️ Отменить последнее", on_click=on_undo,
+                disabled=len(st.session_state["history"]) <= 1, use_container_width=True)
+reset_col.button("⏮ Сбросить к исходному", on_click=on_reset,
+                 disabled=len(st.session_state["history"]) <= 1, use_container_width=True)
+
+st.download_button(
+    "⬇️ Скачать текущую версию",
+    data=st.session_state["history"][-1],
+    file_name=f"formatted_{uploaded.name}",
+    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+)
+
+with st.expander(f"История правок ({len(st.session_state['steps'])})"):
+    for i, step in enumerate(st.session_state["steps"]):
+        st.write(f"{i}. {step}")
