@@ -1136,17 +1136,155 @@ MAX_HISTORY = 20  # сколько версий документа хранит�
 
 
 # ---------------------------------------------------------------------------
-# 4. ИНТЕРФЕЙС STREAMLIT
-# Состояние в session_state:
-#   history  - список версий документа (байты), последняя = текущая
-#   steps    - подписи версий (для списка «История правок»)
+# 4. ИНТЕРФЕЙС STREAMLIT: две страницы — главная и редактор
+# Переключение страниц: st.session_state["page"] = "home" | "editor".
+# Состояние редактора в session_state:
+#   history      - список версий документа (байты), последняя = текущая
+#   steps        - подписи версий (для списка «История правок»)
 #   pending_json - команды, ожидающие подтверждения (редактируемый текст)
 # ---------------------------------------------------------------------------
+PROJECT_NAME = "Textio"  # поменяйте на своё название проекта
+TAGLINE = "Форматируйте Word словами"
+
+PRESET_INFO = {
+    "🎓 ГОСТ (курсовая)": "Times New Roman 14, интервал 1.5, поля 3/2/1.5/2 см, красная строка, номер страницы снизу.",
+    "🎓 ГОСТ + титул без номера": "То же, что ГОСТ, но на титульном листе номер страницы не отображается.",
+    "📰 Статья (2 колонки)": "Две колонки, Times New Roman 10, выравнивание по ширине, узкие поля.",
+    "💼 Деловой (Arial 11)": "Arial 11, интервал 1.15, выравнивание по левому краю, «Страница X из Y» справа.",
+}
+
+FEATURES = [
+    ("🗣️", "Пишите обычными словами",
+     "«Шрифт 14, интервал 1.5, заголовки по центру» — без поиска нужных кнопок в меню Word."),
+    ("📋", "Готовые шаблоны",
+     "ГОСТ для курсовой, статья в две колонки, деловой документ — оформление в один клик."),
+    ("🎯", "Копируйте оформление по образцу",
+     "Загрузите красиво оформленный документ: поля, шрифты, колонтитулы и заголовки перенесутся в ваш файл."),
+    ("👀", "ИИ под вашим контролем",
+     "Перед применением вы видите, что именно понял ИИ, и можете поправить. Любой шаг можно отменить."),
+    ("📑", "Сложное оформление",
+     "Списки, таблицы, оглавление, разрывы страниц, замена текста, титульный лист без номера."),
+    ("🔒", "Документ не уходит в ИИ целиком",
+     "Для текстового запроса ИИ получает лишь краткий план: первые слова абзацев. Шаблоны и образец работают без ИИ."),
+]
+
+STEPS = [
+    ("1", "Загрузите документ", "Подойдёт любой файл в формате .docx."),
+    ("2", "Выберите способ", "Текстовый запрос, готовый шаблон или оформление по образцу."),
+    ("3", "Проверьте и скачайте", "Посмотрите изменения, отмените лишнее и скачайте готовый файл."),
+]
+
+EXAMPLES = [
+    "Заголовки по центру, основной текст Times New Roman 14 по ширине",
+    "Сделай текст в две колонки и добавь номера страниц внизу",
+    "Титульный лист без номера, оглавление в самом начале",
+    "Замени «Иванов» на «Петров» во всём документе",
+    "Оформи таблицы с рамками и серой шапкой",
+]
+
+GLOBAL_CSS = """
+<style>
+#MainMenu, footer {visibility: hidden;}
+header[data-testid="stHeader"] {background: transparent;}
+.block-container {max-width: 1100px; padding-top: 2rem; padding-bottom: 4rem;}
+:root {--card-bg: rgba(128,128,128,.08); --card-border: rgba(128,128,128,.28);}
+
+.gradient-text {
+  background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899);
+  -webkit-background-clip: text; background-clip: text; color: transparent;
+}
+.hero {text-align: center; padding: 3rem 1rem 1.2rem;}
+.badge {
+  display: inline-block; padding: .35rem .95rem; border-radius: 999px; margin-bottom: 1.3rem;
+  border: 1px solid var(--card-border); background: var(--card-bg); font-size: .85rem;
+}
+.hero-title {
+  font-size: clamp(3.2rem, 10vw, 6rem); font-weight: 800; line-height: 1.05; letter-spacing: -.03em;
+  margin-bottom: .5rem;
+}
+.hero-tagline {font-size: clamp(1.3rem, 3.2vw, 2rem); font-weight: 600; margin-bottom: 1rem;}
+.hero-lead {max-width: 680px; margin: 0 auto 1.8rem; font-size: 1.15rem; line-height: 1.65; opacity: .8;}
+.hint {text-align: center; opacity: .6; font-size: .9rem; margin-top: .6rem;}
+
+.stats {display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; margin: 2.2rem 0 1rem;}
+.stat {
+  min-width: 170px; text-align: center; padding: 1rem 1.4rem; border-radius: 16px;
+  border: 1px solid var(--card-border); background: var(--card-bg);
+}
+.stat-num {font-size: 2rem; font-weight: 800;}
+.stat-label {opacity: .7; font-size: .9rem;}
+
+.section-title {text-align: center; font-size: 2rem; font-weight: 700; margin: 3.5rem 0 .4rem;}
+.section-sub {text-align: center; opacity: .7; margin-bottom: 1.8rem;}
+.cards {display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 1.1rem;}
+.card {
+  border: 1px solid var(--card-border); background: var(--card-bg); border-radius: 18px; padding: 1.4rem;
+  transition: transform .2s ease, border-color .2s ease;
+}
+.card:hover {transform: translateY(-4px); border-color: #a855f7;}
+.card-icon {font-size: 2rem; margin-bottom: .5rem;}
+.card-title {font-size: 1.15rem; font-weight: 700; margin-bottom: .4rem;}
+.card-text {opacity: .75; line-height: 1.55; font-size: .96rem;}
+.step-num {
+  width: 42px; height: 42px; border-radius: 50%; margin-bottom: .8rem; color: #fff; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+  background: linear-gradient(135deg, #6366f1, #ec4899);
+}
+.chips {display: flex; flex-wrap: wrap; gap: .6rem; justify-content: center;}
+.chip {
+  padding: .55rem 1rem; border-radius: 999px; font-size: .95rem;
+  border: 1px solid var(--card-border); background: var(--card-bg);
+}
+.cta-text {text-align: center; margin: 3.5rem 0 1.2rem;}
+.cta-title {font-size: clamp(1.8rem, 4vw, 2.6rem); font-weight: 800; margin-bottom: .4rem;}
+.footer-note {text-align: center; opacity: .5; font-size: .85rem; margin-top: 3rem;}
+
+.editor-title {font-size: 1.6rem; font-weight: 800; padding-top: .3rem;}
+
+/* акцентные кнопки */
+div.stButton > button[kind="primary"],
+div.stDownloadButton > button[kind="primary"],
+button[data-testid="stBaseButton-primary"] {
+  background: linear-gradient(90deg, #6366f1, #a855f7, #ec4899); border: none; color: #fff;
+  border-radius: 12px; font-weight: 600; transition: transform .15s ease, filter .15s ease;
+}
+div.stButton > button[kind="primary"]:hover,
+div.stDownloadButton > button[kind="primary"]:hover,
+button[data-testid="stBaseButton-primary"]:hover {filter: brightness(1.12); transform: translateY(-1px); color: #fff;}
+button[data-baseweb="tab"] p {font-size: 1.05rem; font-weight: 600;}
+</style>
+"""
+
+HOME_CSS = """
+<style>
+div.stButton > button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+  padding: .8rem 1.5rem; border-radius: 14px; box-shadow: 0 10px 30px rgba(168,85,247,.35);
+}
+div.stButton > button[kind="primary"] p, button[data-testid="stBaseButton-primary"] p {
+  font-size: 1.2rem; font-weight: 700;
+}
+</style>
+"""
+
+
+def html(markup: str) -> None:
+    """Выводит HTML. Отступы убираем, иначе Markdown примет строки за блок кода."""
+    cleaned = "\n".join(line.strip() for line in markup.splitlines() if line.strip())
+    st.markdown(cleaned, unsafe_allow_html=True)
+
+
+# --- состояние и обработчики кнопок (callbacks) ---
 def init_state():
+    st.session_state.setdefault("page", "home")
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("steps", [])
     st.session_state.setdefault("file_key", None)
+    st.session_state.setdefault("doc_name", "document.docx")
     st.session_state.setdefault("pending_label", "")
+
+
+def go(page: str):
+    st.session_state["page"] = page
 
 
 def current_doc() -> Document:
@@ -1170,7 +1308,6 @@ def run_commands(commands: list[dict], label: str) -> None:
     st.session_state["flash"] = ("success", f"Применено: {label}", log)
 
 
-# --- обработчики кнопок (callbacks) ---
 def on_preset(name: str):
     run_commands(PRESETS[name], name)
 
@@ -1206,136 +1343,234 @@ def on_reset():
     st.session_state["flash"] = ("info", "Документ возвращён к исходному виду.", [])
 
 
-# --- страница ---
-st.set_page_config(page_title="Word-форматтер на ИИ", page_icon="📝")
-init_state()
-st.title("📝 Форматирование Word с помощью ИИ")
-st.caption("Загрузите документ один раз и вносите правки по шагам: пресеты, текстовые запросы, образец. "
-           "Любой шаг можно отменить.")
+# --- формирование команд (результат попадает на проверку, а не применяется сразу) ---
+def set_pending(commands: list[dict], label: str) -> None:
+    if not commands:
+        st.warning("Не нашлось подходящих команд. Попробуйте переформулировать запрос.")
+        return
+    st.session_state["pending_json"] = json.dumps({"commands": commands}, ensure_ascii=False, indent=2)
+    st.session_state["pending_label"] = label
+    st.toast("Команды готовы: проверьте их ниже и нажмите «Применить»")
 
-with st.sidebar:
-    st.header("Настройки")
-    typed_key = st.text_input("Gemini API-ключ", type="password",
-                              help="Нужен только для текстовых запросов. Пресеты и образец работают без ключа.")
-    copy_hf_text = st.checkbox(
-        "Копировать текст колонтитулов из образца",
-        value=True,
-        help="Если выключить, из образца будут скопированы только колонтитулы с номерами страниц.",
-    )
-    st.markdown(f"Модель: `{MODEL_NAME}`")
 
-api_key = typed_key or get_api_key()
-
-uploaded = st.file_uploader("1. Загрузите файл Word", type=["docx"], key="target")
-if uploaded is None:
-    st.info("Загрузите .docx-файл, чтобы начать.")
-    st.stop()
-
-# Новый файл -> начинаем историю заново. Тот же файл -> сохраняем накопленные правки.
-file_key = f"{uploaded.name}:{uploaded.size}"
-if st.session_state["file_key"] != file_key:
+def generate_from_prompt(prompt: str, api_key: str | None) -> None:
+    if not prompt.strip():
+        st.warning("Напишите, что нужно изменить в документе.")
+        return
+    if not api_key:
+        st.error("Не найден API-ключ Gemini. Введите его выше или задайте переменную GEMINI_API_KEY.")
+        return
     try:
-        Document(io.BytesIO(uploaded.getvalue()))  # проверка, что файл открывается
+        with st.spinner("Gemini формирует команды (при перегрузке может занять до минуты)..."):
+            commands, _model = ask_gemini(api_key, prompt, build_outline(current_doc()))
     except Exception as exc:
-        st.error(f"Не удалось открыть файл (он точно .docx?): {exc}")
+        st.error(f"Ошибка при обращении к Gemini: {exc}")
+        return
+    set_pending(commands, f"запрос «{prompt.strip()[:40]}»")
+
+
+def generate_from_sample(example_file, copy_hf_text: bool) -> None:
+    if example_file is None:
+        st.warning("Сначала загрузите документ-образец.")
+        return
+    try:
+        example_doc = Document(io.BytesIO(example_file.getvalue()))
+        commands = extract_format_commands(example_doc, current_doc(), copy_hf_text)
+    except Exception as exc:
+        st.error(f"Не удалось прочитать образец: {exc}")
+        return
+    set_pending(commands, "образец")
+
+
+# ---------------------------------------------------------------------------
+# СТРАНИЦА 1: ГЛАВНАЯ
+# ---------------------------------------------------------------------------
+def render_home() -> None:
+    html(HOME_CSS)
+    html(f"""
+    <div class="hero">
+      <div class="badge">✨ ИИ-помощник для документов Word</div>
+      <div class="hero-title"><span class="gradient-text">{PROJECT_NAME}</span></div>
+      <div class="hero-tagline">{TAGLINE}</div>
+      <div class="hero-lead">
+        Загрузите документ и опишите, что нужно изменить, выберите готовый шаблон
+        или скопируйте оформление с образца. Шрифты, поля, колонтитулы, оглавление
+        и таблицы будут оформлены без возни с меню Word.
+      </div>
+    </div>
+    """)
+    _, middle, _ = st.columns([1.2, 1, 1.2])
+    with middle:
+        st.button("🚀 Начать прямо сейчас", type="primary", on_click=go, args=("editor",),
+                  use_container_width=True, key="cta_top")
+    html('<div class="hint">Без регистрации · шаблоны и образец работают без ИИ-ключа</div>')
+
+    html("""
+    <div class="stats">
+      <div class="stat"><div class="stat-num gradient-text">3</div><div class="stat-label">способа оформления</div></div>
+      <div class="stat"><div class="stat-num gradient-text">16</div><div class="stat-label">операций над документом</div></div>
+      <div class="stat"><div class="stat-num gradient-text">20</div><div class="stat-label">шагов отмены</div></div>
+    </div>
+    """)
+
+    html('<div class="section-title">Почему это удобно</div>'
+         '<div class="section-sub">Меньше рутины — больше времени на сам текст</div>')
+    cards = "".join(
+        f'<div class="card"><div class="card-icon">{icon}</div>'
+        f'<div class="card-title">{title}</div><div class="card-text">{text}</div></div>'
+        for icon, title, text in FEATURES
+    )
+    html(f'<div class="cards">{cards}</div>')
+
+    html('<div class="section-title">Как это работает</div>'
+         '<div class="section-sub">Три шага от исходного файла до готового</div>')
+    steps = "".join(
+        f'<div class="card"><div class="step-num">{num}</div>'
+        f'<div class="card-title">{title}</div><div class="card-text">{text}</div></div>'
+        for num, title, text in STEPS
+    )
+    html(f'<div class="cards">{steps}</div>')
+
+    html('<div class="section-title">Что можно попросить</div>'
+         '<div class="section-sub">Примеры запросов — формулируйте своими словами</div>')
+    chips = "".join(f'<div class="chip">«{example}»</div>' for example in EXAMPLES)
+    html(f'<div class="chips">{chips}</div>')
+
+    html('<div class="cta-text"><div class="cta-title">Готовы оформить документ?</div>'
+         '<div class="section-sub">Это займёт пару минут</div></div>')
+    _, middle, _ = st.columns([1.2, 1, 1.2])
+    with middle:
+        st.button("🚀 Начать прямо сейчас", type="primary", on_click=go, args=("editor",),
+                  use_container_width=True, key="cta_bottom")
+    html(f'<div class="footer-note">{PROJECT_NAME} · Streamlit · Gemini · python-docx</div>')
+
+
+# ---------------------------------------------------------------------------
+# СТРАНИЦА 2: РЕДАКТОР
+# ---------------------------------------------------------------------------
+def render_editor() -> None:
+    back_col, title_col = st.columns([1, 4])
+    back_col.button("← На главную", on_click=go, args=("home",), key="back_home")
+    title_col.markdown(f'<div class="editor-title">📝 Редактор · <span class="gradient-text">{PROJECT_NAME}</span></div>',
+                       unsafe_allow_html=True)
+
+    # --- загрузка документа ---
+    has_doc = bool(st.session_state["history"])
+    uploaded = st.file_uploader(
+        "Заменить документ" if has_doc else "Загрузите файл Word (.docx), который нужно оформить",
+        type=["docx"], key="target",
+    )
+    if uploaded is not None:
+        file_key = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state["file_key"] != file_key:  # новый файл -> история начинается заново
+            try:
+                Document(io.BytesIO(uploaded.getvalue()))  # проверка, что файл открывается
+            except Exception as exc:
+                st.error(f"Не удалось открыть файл (он точно .docx?): {exc}")
+                st.stop()
+            st.session_state["history"] = [uploaded.getvalue()]
+            st.session_state["steps"] = ["Исходный файл"]
+            st.session_state["file_key"] = file_key
+            st.session_state["doc_name"] = uploaded.name
+            st.session_state.pop("pending_json", None)
+            st.session_state.pop("flash", None)
+    if not st.session_state["history"]:
+        st.info("Загрузите .docx-файл, чтобы начать. Дальше можно оформить его запросом, шаблоном или по образцу.")
         st.stop()
-    st.session_state["history"] = [uploaded.getvalue()]
-    st.session_state["steps"] = ["Исходный файл"]
-    st.session_state["file_key"] = file_key
-    st.session_state.pop("pending_json", None)
-    st.session_state.pop("flash", None)
 
-# Сообщение о результате последнего действия
-flash = st.session_state.pop("flash", None)
-if flash:
-    kind, text, log = flash
-    getattr(st, kind)(text)
-    if log:
-        with st.expander("Что было сделано"):
-            for line in log:
-                st.write(line)
+    # --- сообщение о результате последнего действия ---
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        kind, text, log = flash
+        getattr(st, kind)(text)
+        if log:
+            with st.expander("Что было сделано"):
+                for line in log:
+                    st.write(line)
 
-# --- Пресеты ---
-st.subheader("Готовые пресеты")
-preset_cols = st.columns(len(PRESETS))
-for col, name in zip(preset_cols, PRESETS):
-    col.button(name, on_click=on_preset, args=(name,), use_container_width=True)
+    left, right = st.columns([3, 2], gap="large")
 
-# --- Образец и текстовый запрос ---
-st.subheader("Свой запрос")
-example_file = st.file_uploader(
-    "2. (Необязательно) Образец оформления", type=["docx"], key="example",
-    help="Берутся: размер страницы, поля, колонки, колонтитулы, шрифты, выравнивание, интервалы, заголовки.",
-)
-user_prompt = st.text_area(
-    "3. Что сделать с документом? (необязательно, если загружен образец)",
-    placeholder="Например: заголовки по центру, шрифт Arial 12, интервал 1.5",
-    height=100,
-)
+    with left:
+        tab_text, tab_preset, tab_sample = st.tabs(["✍️ Текстовый запрос", "📋 По шаблону", "🎯 По образцу"])
 
-if st.button("Сформировать команды", type="primary"):
-    has_prompt = bool(user_prompt.strip())
-    if not has_prompt and example_file is None:
-        st.warning("Загрузите образец или напишите, что нужно изменить.")
-    elif has_prompt and not api_key:
-        st.error("Не найден API-ключ Gemini. Введите его в боковой панели или задайте GEMINI_API_KEY.")
-    else:
-        doc = current_doc()
-        commands, labels = [], []
-
-        if example_file is not None:
-            try:
-                example_doc = Document(io.BytesIO(example_file.getvalue()))
-                commands += extract_format_commands(example_doc, doc, copy_hf_text)
-                labels.append("образец")
-            except Exception as exc:
-                st.error(f"Не удалось прочитать образец: {exc}")
-                st.stop()
-
-        if has_prompt:
-            try:
-                with st.spinner("Gemini формирует команды (при перегрузке может занять до минуты)..."):
-                    prompt_commands, used_model = ask_gemini(api_key, user_prompt, build_outline(doc))
-                commands += prompt_commands
-                labels.append(f"запрос «{user_prompt.strip()[:40]}»")
-            except Exception as exc:
-                st.error(f"Ошибка при обращении к Gemini: {exc}")
-                st.stop()
-
-        if commands:
-            # Ничего не применяем: сначала показываем команды на проверку
-            st.session_state["pending_json"] = json.dumps(
-                {"commands": commands}, ensure_ascii=False, indent=2
+        with tab_text:
+            st.caption("Опишите словами, что изменить. ИИ переведёт это в команды, а вы проверите их перед применением.")
+            typed_key = st.text_input(
+                "Gemini API-ключ", type="password", key="api_key_input",
+                help="Бесплатный ключ создаётся на aistudio.google.com. Можно задать переменную GEMINI_API_KEY "
+                     "или secrets.toml, тогда вводить не нужно.",
             )
-            st.session_state["pending_label"] = " + ".join(labels)
-        else:
-            st.warning("Не нашлось подходящих команд. Попробуйте переформулировать запрос.")
+            user_prompt = st.text_area(
+                "Что нужно сделать с документом?", key="prompt_text", height=130,
+                placeholder="Например: заголовки по центру, шрифт Arial 12, интервал 1.5, "
+                            "внизу номер страницы, титульный лист без номера",
+            )
+            if st.button("Сформировать команды", type="primary", key="gen_text"):
+                generate_from_prompt(user_prompt, typed_key or get_api_key())
+            st.caption(f"Модель: `{MODEL_NAME}`")
 
-# --- Проверка команд перед применением ---
-if "pending_json" in st.session_state:
-    st.subheader("Проверьте команды")
-    st.caption("Это то, что будет применено к документу. JSON можно отредактировать вручную.")
-    st.text_area("JSON-команды", key="pending_json", height=320, label_visibility="collapsed")
-    apply_col, discard_col = st.columns(2)
-    apply_col.button("✅ Применить", on_click=on_apply_pending, type="primary", use_container_width=True)
-    discard_col.button("🗑 Отклонить", on_click=on_discard_pending, use_container_width=True)
+        with tab_preset:
+            st.caption("Готовые наборы оформления. Применяются сразу, ИИ и ключ не нужны.")
+            for name in PRESETS:
+                with st.container(border=True):
+                    st.markdown(f"**{name}**")
+                    st.caption(PRESET_INFO.get(name, ""))
+                    st.button("Применить", key=f"preset_{name}", on_click=on_preset, args=(name,))
 
-# --- Результат, отмена и скачивание ---
-st.divider()
-st.subheader("Результат")
-undo_col, reset_col = st.columns(2)
-undo_col.button("↩️ Отменить последнее", on_click=on_undo,
-                disabled=len(st.session_state["history"]) <= 1, use_container_width=True)
-reset_col.button("⏮ Сбросить к исходному", on_click=on_reset,
-                 disabled=len(st.session_state["history"]) <= 1, use_container_width=True)
+        with tab_sample:
+            st.caption("Загрузите документ с нужным оформлением: размер страницы, поля, колонки, колонтитулы, "
+                       "шрифты, интервалы и заголовки будут перенесены в ваш файл. ИИ и ключ не нужны.")
+            example_file = st.file_uploader("Документ-образец (.docx)", type=["docx"], key="example")
+            copy_hf_text = st.checkbox(
+                "Копировать текст колонтитулов из образца", value=True,
+                help="Если выключить, скопируются только колонтитулы с номерами страниц, "
+                     "а обычный текст (фамилия, название работы) нет.",
+            )
+            if st.button("Сформировать команды по образцу", type="primary", key="gen_sample"):
+                generate_from_sample(example_file, copy_hf_text)
 
-st.download_button(
-    "⬇️ Скачать текущую версию",
-    data=st.session_state["history"][-1],
-    file_name=f"formatted_{uploaded.name}",
-    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-)
+        # --- проверка команд перед применением (общая для вкладок «запрос» и «образец») ---
+        if "pending_json" in st.session_state:
+            st.divider()
+            st.markdown("#### 🔍 Проверьте команды")
+            st.caption("Это то, что будет применено к документу. JSON можно отредактировать вручную.")
+            st.text_area("JSON-команды", key="pending_json", height=320, label_visibility="collapsed")
+            apply_col, discard_col = st.columns(2)
+            apply_col.button("✅ Применить", on_click=on_apply_pending, type="primary",
+                             use_container_width=True, key="apply_pending")
+            discard_col.button("🗑 Отклонить", on_click=on_discard_pending,
+                               use_container_width=True, key="discard_pending")
 
-with st.expander(f"История правок ({len(st.session_state['steps'])})"):
-    for i, step in enumerate(st.session_state["steps"]):
-        st.write(f"{i}. {step}")
+    with right:
+        with st.container(border=True):
+            st.markdown("#### 📄 Результат")
+            st.caption(f"{st.session_state['doc_name']} · версия {len(st.session_state['history'])}")
+            st.download_button(
+                "⬇️ Скачать документ",
+                data=st.session_state["history"][-1],
+                file_name=f"formatted_{st.session_state['doc_name']}",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                type="primary", use_container_width=True,
+            )
+            undo_col, reset_col = st.columns(2)
+            can_undo = len(st.session_state["history"]) > 1
+            undo_col.button("↩️ Отменить", on_click=on_undo, disabled=not can_undo,
+                            use_container_width=True, key="undo")
+            reset_col.button("⏮ Сбросить", on_click=on_reset, disabled=not can_undo,
+                             use_container_width=True, key="reset")
+        with st.expander(f"История правок ({len(st.session_state['steps'])})"):
+            for i, step in enumerate(st.session_state["steps"]):
+                st.write(f"{i}. {step}")
+
+
+# ---------------------------------------------------------------------------
+# ТОЧКА ВХОДА
+# ---------------------------------------------------------------------------
+st.set_page_config(page_title=f"{PROJECT_NAME}: форматирование Word с ИИ", page_icon="📝",
+                   layout="wide", initial_sidebar_state="collapsed")
+init_state()
+html(GLOBAL_CSS)
+if st.session_state["page"] == "editor":
+    render_editor()
+else:
+    render_home()
