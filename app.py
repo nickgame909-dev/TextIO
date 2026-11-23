@@ -6,6 +6,7 @@
     --> Python-функции на python-docx --> готовый .docx для скачивания
 """
 
+import hashlib
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import time
 from collections import Counter
 
 import streamlit as st
+from lxml import etree
 from docx import Document
 from docx.enum.section import WD_ORIENT
 from docx.enum.style import WD_STYLE_TYPE
@@ -252,6 +254,8 @@ def set_run_font(run, spec: dict) -> None:
     if name:
         run.font.name = name
         rfonts = run._element.rPr.rFonts
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:eastAsiaTheme", "w:cstheme"):
+            rfonts.attrib.pop(qn(theme_attr), None)  # иначе шрифт темы перебьёт наш
         rfonts.set(qn("w:eastAsia"), name)  # чтобы шрифт применился и к CJK/кириллице в Word
         rfonts.set(qn("w:cs"), name)
     if spec.get("size_pt"):
@@ -418,25 +422,102 @@ def _font_value(font, attr: str):
     return font.color.rgb if attr == "color" else getattr(font, attr)
 
 
-def resolve_font_attr(doc: Document, run, paragraph, attr: str):
-    """
-    Настоящее значение свойства шрифта. В Word оно часто не записано в самом тексте,
-    а наследуется: run -> стиль абзаца -> родительские стили -> настройки по умолчанию.
-    """
-    value = _font_value(run.font, attr)
-    if value is not None:
-        return value
+THEME_NS = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+
+
+def theme_font_names(doc: Document) -> dict:
+    """Шрифты темы документа: {'major': шрифт заголовков, 'minor': шрифт основного текста}."""
+    cached = getattr(doc, "_theme_fonts_cache", None)
+    if cached is not None:
+        return cached
+    fonts = {}
+    try:
+        root = etree.fromstring(doc.part.part_related_by(RT.THEME).blob)
+        for key, tag in (("major", "majorFont"), ("minor", "minorFont")):
+            found = root.xpath(f"//a:{tag}/a:latin/@typeface", namespaces=THEME_NS)
+            fonts[key] = str(found[0]) if found else None
+    except Exception:  # в файле может не быть темы
+        fonts = {}
+    try:
+        doc._theme_fonts_cache = fonts
+    except AttributeError:
+        pass
+    return fonts
+
+
+def theme_name_from_rfonts(doc: Document, rfonts):
+    """Если шрифт задан ссылкой на тему (asciiTheme="minorHAnsi"), возвращает его настоящее имя."""
+    if rfonts is None:
+        return None
+    ref = rfonts.get(qn("w:asciiTheme")) or rfonts.get(qn("w:hAnsiTheme"))
+    if not ref:
+        return None
+    return theme_font_names(doc).get("major" if ref.startswith("major") else "minor")
+
+
+# Кэш наследования стилей. Чтение стилей через python-docx медленное (на документе из 1500 абзацев
+# без кэша снимок занимал десятки секунд), а значение зависит только от стиля, а не от абзаца.
+# Стили могут меняться командами, поэтому кэш сбрасывается перед каждым новым снимком документа.
+# Кэш хранится в части документа (doc.part): объект Document python-docx каждый раз создаётся заново.
+def reset_format_cache(doc: Document) -> None:
+    try:
+        doc.part._fmt_cache = {}
+    except AttributeError:
+        pass
+
+
+def _cached(part, key: tuple, compute):
+    cache = getattr(part, "_fmt_cache", None)
+    if cache is None:
+        return compute()
+    if key not in cache:
+        cache[key] = compute()
+    return cache[key]
+
+
+def _read_font(doc: Document, font, rpr, attr: str):
+    if attr == "name":
+        return font.name or theme_name_from_rfonts(doc, rpr.rFonts if rpr is not None else None)
+    return _font_value(font, attr)
+
+
+def _font_from_styles(doc: Document, paragraph, attr: str):
     style = paragraph.style
     while style is not None:
-        value = _font_value(style.font, attr)
+        value = _read_font(doc, style.font, style.element.rPr, attr)
         if value is not None:
             return value
         style = style.base_style
     if attr == "name":
-        return docdefault(doc, "w:docDefaults/w:rPrDefault/w:rPr/w:rFonts/@w:ascii")
+        defaults = doc.styles.element.xpath("w:docDefaults/w:rPrDefault/w:rPr/w:rFonts")
+        if defaults:
+            return defaults[0].get(qn("w:ascii")) or theme_name_from_rfonts(doc, defaults[0])
     if attr == "size":
         half_points = docdefault(doc, "w:docDefaults/w:rPrDefault/w:rPr/w:sz/@w:val")
         return Pt(int(half_points) / 2) if half_points else None
+    return None
+
+
+def resolve_font_attr(doc: Document, run, paragraph, attr: str):
+    """
+    Настоящее значение свойства шрифта. В Word оно часто не записано в самом тексте,
+    а наследуется: run -> стиль абзаца -> родительские стили -> настройки по умолчанию.
+    Имя шрифта может быть ссылкой на тему Word (Calibri/Aptos), её тоже раскрываем.
+    """
+    value = _read_font(doc, run.font, run._r.rPr, attr)
+    if value is not None:
+        return value
+    return _cached(doc.part, ("font", paragraph._p.style, attr),
+                   lambda: _font_from_styles(doc, paragraph, attr))
+
+
+def _pf_from_styles(paragraph, attr: str):
+    style = paragraph.style
+    while style is not None:
+        value = getattr(style.paragraph_format, attr)
+        if value is not None:
+            return value
+        style = style.base_style
     return None
 
 
@@ -445,13 +526,7 @@ def resolve_pf(paragraph, attr: str):
     value = getattr(paragraph.paragraph_format, attr)
     if value is not None:
         return value
-    style = paragraph.style
-    while style is not None:
-        value = getattr(style.paragraph_format, attr)
-        if value is not None:
-            return value
-        style = style.base_style
-    return None
+    return _cached(paragraph.part, ("pf", paragraph._p.style, attr), lambda: _pf_from_styles(paragraph, attr))
 
 
 def dominant_format(doc: Document, paragraphs: list) -> dict:
@@ -574,6 +649,7 @@ def header_footer_command(example: Document, action: str, container, copy_text: 
 
 def extract_format_commands(example: Document, target: Document, copy_hf_text: bool = True) -> list[dict]:
     """Главная функция: документ-образец -> список JSON-команд."""
+    reset_format_cache(example)
     commands = []
     section = example.sections[0]
 
@@ -605,6 +681,22 @@ def extract_format_commands(example: Document, target: Document, copy_hf_text: b
         cmd = header_footer_command(example, action, container, copy_hf_text)
         if cmd:
             commands.append(cmd)
+
+    # Колонтитулы первой страницы (титульный лист)
+    if section.different_first_page_header_footer:
+        first = {"action": "set_first_page", "different": True, "header_text": "", "footer_text": ""}
+        for key, container in (("header_text", section.first_page_header),
+                               ("footer_text", section.first_page_footer)):
+            if container.is_linked_to_previous:
+                continue
+            for p in container.paragraphs:
+                text = paragraph_text_with_fields(p).strip()
+                if text and (copy_hf_text or "{PAGE}" in text or "{NUMPAGES}" in text):
+                    first[key] = text
+                    break
+        commands.append(first)
+    else:
+        commands.append({"action": "set_first_page", "different": False})
 
     # Основной текст
     body = [p for p in example.paragraphs if p.text.strip() and not is_heading(p)]
@@ -1063,18 +1155,384 @@ ACTIONS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 3.4 ПОНЯТНОЕ ОПИСАНИЕ ПРАВОК
+#   describe_command()  - «что будет сделано» человеческими словами (ДО применения)
+#   capture_state()     - снимок документа (делаем до и после правок)
+#   summarize_changes() - «что изменилось: было -> стало» по двум снимкам (ПОСЛЕ применения)
+# Сравнение идёт по реальному документу, а не по тексту команд, поэтому оно честно
+# показывает и случаи, когда команда выполнилась, но ничего не изменила.
+# ---------------------------------------------------------------------------
+ALIGN_RU = {
+    "left": "по левому краю",
+    "center": "по центру",
+    "right": "по правому краю",
+    "justify": "по ширине",
+}
+
+
+def num(value) -> str:
+    """12.0 -> '12', 1.25 -> '1.25'."""
+    return f"{float(value):.2f}".rstrip("0").rstrip(".")
+
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def show_fields(text: str) -> str:
+    """{PAGE} -> читаемая подпись для пользователя."""
+    return text.replace("{PAGE}", "[номер страницы]").replace("{NUMPAGES}", "[всего страниц]")
+
+
+def describe_target(target) -> str:
+    """Родительный падеж: «для ...» + результат."""
+    target = target if isinstance(target, dict) else {}
+    kind = target.get("type", "all")
+    if kind == "headings":
+        return "заголовков"
+    if kind == "body":
+        return "основного текста"
+    if kind == "paragraphs":
+        labels = [f"№{i}" if int(i) > 0 else f"{abs(int(i))}-го с конца" for i in target.get("indexes", [])]
+        return "абзацев " + ", ".join(labels) if labels else "абзацев"
+    if kind == "contains":
+        return f"абзацев со словом «{target.get('text', '')}»"
+    if kind == "style":
+        return f"абзацев стиля «{target.get('name', '')}»"
+    return "всего текста"
+
+
+def describe_font_props(spec: dict) -> str:
+    parts = []
+    name = spec.get("name") or spec.get("font_name")
+    if name:
+        parts.append(str(name))
+    if spec.get("size_pt"):
+        parts.append(f"{num(spec['size_pt'])} пт")
+    for key, yes, no in (("bold", "жирный", "не жирный"), ("italic", "курсив", "без курсива"),
+                         ("underline", "подчёркнутый", "без подчёркивания")):
+        if spec.get(key) is not None:
+            parts.append(yes if spec[key] else no)
+    if spec.get("color"):
+        parts.append(f"цвет #{str(spec['color']).lstrip('#').upper()}")
+    return ", ".join(parts)
+
+
+def describe_spacing_props(spec: dict) -> str:
+    parts = []
+    if spec.get("line_spacing") is not None:
+        parts.append(f"межстрочный интервал {num(spec['line_spacing'])}")
+    if spec.get("space_before_pt") is not None:
+        parts.append(f"отступ перед абзацем {num(spec['space_before_pt'])} пт")
+    if spec.get("space_after_pt") is not None:
+        parts.append(f"отступ после абзаца {num(spec['space_after_pt'])} пт")
+    if spec.get("first_line_indent_cm") is not None:
+        parts.append(f"красная строка {num(spec['first_line_indent_cm'])} см")
+    if spec.get("left_indent_cm") is not None:
+        parts.append(f"отступ слева {num(spec['left_indent_cm'])} см")
+    return ", ".join(parts)
+
+
+def _describe(cmd: dict) -> str:
+    action = cmd.get("action")
+    target = describe_target(cmd.get("target"))
+
+    if action == "set_alignment":
+        align = str(cmd.get("align", "")).lower()
+        return f"Выравнивание {ALIGN_RU.get(align, align)} для {target}"
+    if action == "set_font":
+        return f"Шрифт ({describe_font_props(cmd) or 'без изменений'}) для {target}"
+    if action == "set_paragraph_format":
+        return f"Параметры абзацев для {target}: {describe_spacing_props(cmd) or 'без изменений'}"
+    if action == "set_columns":
+        n = int(cmd.get("count", 1))
+        if n <= 1:
+            return "Текст в одну колонку"
+        extra = ", с вертикальной линией между ними" if cmd.get("line_between") else ""
+        return f"Текст в {n} {plural(n, 'колонку', 'колонки', 'колонок')}{extra}"
+    if action in ("set_header", "set_footer"):
+        title = "Верхний" if action == "set_header" else "Нижний"
+        text = show_fields(str(cmd.get("text", "")))
+        result = f"{title} колонтитул: «{text}»" if text else f"{title} колонтитул очищен"
+        if text and cmd.get("align"):
+            result += f", {ALIGN_RU.get(str(cmd['align']).lower(), cmd['align'])}"
+        props = describe_font_props(cmd)
+        return result + (f" ({props})" if props and text else "")
+    if action == "set_margins":
+        names = (("top_cm", "сверху"), ("bottom_cm", "снизу"), ("left_cm", "слева"), ("right_cm", "справа"))
+        parts = [f"{label} {num(cmd[key])} см" for key, label in names if cmd.get(key) is not None]
+        return "Поля страницы: " + (", ".join(parts) or "без изменений")
+    if action == "set_orientation":
+        landscape = str(cmd.get("orientation", "")).lower() == "landscape"
+        return "Ориентация страницы: " + ("альбомная" if landscape else "книжная")
+    if action == "set_page_size":
+        w, h = float(cmd["width_cm"]), float(cmd["height_cm"])
+        a4 = {(21.0, 29.7): "A4", (29.7, 21.0): "A4, альбомная"}
+        label = next((v for (aw, ah), v in a4.items() if abs(w - aw) < 0.1 and abs(h - ah) < 0.1), None)
+        return f"Размер страницы {num(w)}×{num(h)} см" + (f" ({label})" if label else "")
+    if action == "set_list":
+        kind = str(cmd.get("list_type", "bullet")).lower()
+        what = {"bullet": "Маркированный список", "numbered": "Нумерованный список", "none": "Убрать списки"}
+        return f"{what.get(kind, 'Список')} для {target}"
+    if action == "set_table":
+        sel = cmd.get("tables", "all")
+        scope = "всех таблиц" if sel in (None, "all") else "таблиц №" + ", ".join(
+            str(i) for i in (sel if isinstance(sel, list) else [sel]))
+        parts = []
+        if cmd.get("borders") is not None:
+            parts.append("с рамками" if cmd["borders"] else "без рамок")
+        if cmd.get("header_bold") is not None:
+            parts.append("жирная шапка" if cmd["header_bold"] else "шапка без жирного")
+        if cmd.get("header_fill"):
+            parts.append(f"заливка шапки #{str(cmd['header_fill']).lstrip('#').upper()}")
+        if cmd.get("header_repeat"):
+            parts.append("шапка повторяется на каждой странице")
+        if cmd.get("table_align"):
+            parts.append(f"таблица {ALIGN_RU.get(str(cmd['table_align']).lower(), cmd['table_align'])}")
+        if cmd.get("cell_align"):
+            parts.append(f"текст в ячейках {ALIGN_RU.get(str(cmd['cell_align']).lower(), cmd['cell_align'])}")
+        props = describe_font_props(cmd)
+        if props:
+            parts.append(f"шрифт: {props}")
+        return f"Оформление {scope}: " + (", ".join(parts) or "без изменений")
+    if action == "insert_page_break":
+        where = "после" if str(cmd.get("where", "before")).lower() == "after" else "перед"
+        return f"Разрыв страницы {where} — для {target}"
+    if action == "insert_toc":
+        place = "в конце документа" if str(cmd.get("position", "start")).lower() == "end" else "в начале документа"
+        if cmd.get("after_paragraph") is not None:
+            place = f"после абзаца №{cmd['after_paragraph']}"
+        return f"Оглавление (до уровня {cmd.get('levels', 3)}) {place}"
+    if action == "replace_text":
+        extra = " (включая колонтитулы)" if str(cmd.get("scope", "body")).lower() == "all" else ""
+        return f"Замена «{cmd.get('find', '')}» на «{cmd.get('replace', '')}»{extra}"
+    if action == "set_first_page":
+        if cmd.get("different", True):
+            return "Отдельные колонтитулы на первой странице (например, титульный лист без номера)"
+        return "Одинаковые колонтитулы на всех страницах"
+    if action == "set_style":
+        parts = [describe_font_props(cmd)]
+        if cmd.get("align"):
+            parts.append(ALIGN_RU.get(str(cmd["align"]).lower(), str(cmd["align"])))
+        parts.append(describe_spacing_props(cmd))
+        return f"Стиль «{cmd.get('style', '')}»: " + "; ".join(p for p in parts if p)
+    return f"Неизвестная команда «{action}» (будет пропущена)"
+
+
+def describe_command(cmd: dict) -> str:
+    """Понятное описание одной команды. Никогда не падает: для кривой команды вернёт её название."""
+    try:
+        return _describe(cmd)
+    except Exception:
+        return f"Команда «{cmd.get('action')}»"
+
+
+# ----- снимок документа -----------------------------------------------------
+def font_summary(fmt: dict) -> str:
+    parts = []
+    if fmt["name"]:
+        parts.append(str(fmt["name"]))
+    if fmt["size_pt"]:
+        parts.append(f"{num(fmt['size_pt'])} пт")
+    if fmt["bold"]:
+        parts.append("жирный")
+    if fmt["italic"]:
+        parts.append("курсив")
+    if fmt["color"] and str(fmt["color"]).upper() != "000000":
+        parts.append(f"цвет #{str(fmt['color']).upper()}")
+    return ", ".join(parts) or "по умолчанию"
+
+
+def spacing_summary(fmt: dict) -> str:
+    parts = []
+    if fmt["line_spacing"] is not None:
+        parts.append(f"интервал {num(fmt['line_spacing'])}")
+    if fmt["first_line_indent_cm"] is not None:
+        parts.append(f"красная строка {num(fmt['first_line_indent_cm'])} см")
+    if fmt["space_before_pt"] is not None:
+        parts.append(f"перед {num(fmt['space_before_pt'])} пт")
+    if fmt["space_after_pt"] is not None:
+        parts.append(f"после {num(fmt['space_after_pt'])} пт")
+    return ", ".join(parts) or "по умолчанию"
+
+
+def header_footer_summary(container) -> str:
+    if container.is_linked_to_previous:  # своего колонтитула нет
+        return "нет"
+    texts = [paragraph_text_with_fields(p).strip() for p in container.paragraphs]
+    text = " ".join(t for t in texts if t)
+    return f"«{show_fields(text)}»" if text else "пустой"
+
+
+def table_summary(doc: Document) -> str:
+    tables = doc.tables
+    if not tables:
+        return "нет"
+    bordered = shaded = 0
+    for table in tables:
+        borders = table._tbl.tblPr.find(qn("w:tblBorders"))
+        if borders is not None and any(b.get(qn("w:val")) not in ("nil", "none") for b in borders):
+            bordered += 1
+        if table.rows:
+            fills = [shd.get(qn("w:fill")) for shd in table.rows[0]._tr.xpath(".//w:tcPr/w:shd")]
+            if any(f and f.lower() != "auto" for f in fills):
+                shaded += 1
+    return f"{len(tables)}, с рамками: {bordered}, с залитой шапкой: {shaded}"
+
+
+# Подписи для итоговой строки: какие свойства абзаца сравниваем
+PARAGRAPH_ATTRS = {
+    "name": "шрифт", "size_pt": "размер шрифта", "bold": "жирность", "italic": "курсив",
+    "color": "цвет текста", "align": "выравнивание", "line_spacing": "межстрочный интервал",
+    "space_before_pt": "отступ перед абзацем", "space_after_pt": "отступ после абзаца",
+    "first_line_indent_cm": "красная строка",
+}
+TEXT_GROUPS = ("Основной текст", "Заголовки")
+
+
+def capture_state(doc: Document) -> dict:
+    """Снимок документа: страница, колонтитулы, типичное оформление текста и оформление каждого абзаца."""
+    reset_format_cache(doc)  # стили могли измениться командами - читаем заново
+    section = doc.sections[0]
+    snap: dict[str, str] = {}
+
+    if section.page_width and section.page_height:
+        w, h = section.page_width.cm, section.page_height.cm
+        snap["Размер страницы"] = f"{num(w)}×{num(h)} см, {'альбомная' if w > h else 'книжная'}"
+    margins = [(label, getattr(section, attr)) for label, attr in (
+        ("верх", "top_margin"), ("низ", "bottom_margin"), ("лево", "left_margin"), ("право", "right_margin"))]
+    if all(value is not None for _, value in margins):
+        snap["Поля страницы"] = ", ".join(f"{label} {num(value.cm)}" for label, value in margins) + " см"
+
+    cols = section._sectPr.find(qn("w:cols"))
+    snap["Колонки"] = str(int(cols.get(qn("w:num"), 1))) if cols is not None else "1"
+
+    snap["Верхний колонтитул"] = header_footer_summary(section.header)
+    snap["Нижний колонтитул"] = header_footer_summary(section.footer)
+    if section.different_first_page_header_footer:
+        snap["Колонтитулы первой страницы"] = "отдельные"
+        snap["Верхний колонтитул первой страницы"] = header_footer_summary(section.first_page_header)
+        snap["Нижний колонтитул первой страницы"] = header_footer_summary(section.first_page_footer)
+    else:
+        snap["Колонтитулы первой страницы"] = "как на остальных страницах"
+
+    paragraphs = all_paragraphs(doc)
+    groups = (
+        ("Основной текст", [p for p in paragraphs if p.text.strip() and not is_heading(p)]),
+        ("Заголовки", [p for p in paragraphs if p.text.strip() and is_heading(p)]),
+    )
+    for group_name, items in groups:
+        if not items:
+            continue
+        fmt = dominant_format(doc, items)
+        snap[f"{group_name}: шрифт"] = font_summary(fmt)
+        snap[f"{group_name}: выравнивание"] = ALIGN_RU.get(fmt["align"], "по левому краю")
+        snap[f"{group_name}: интервалы и отступы"] = spacing_summary(fmt)
+
+    snap["Таблицы"] = table_summary(doc)
+    in_lists = sum(1 for p in doc.paragraphs if p._p.pPr is not None and p._p.pPr.numPr is not None)
+    snap["Списки"] = f"{in_lists} абз." if in_lists else "нет"
+    breaks = len(doc.element.body.xpath('.//w:br[@w:type="page"]'))
+    breaks += sum(1 for p in doc.paragraphs if p.paragraph_format.page_break_before)
+    snap["Разрывы страниц"] = str(breaks)
+    has_toc = any((e.text or "").strip().upper().startswith("TOC") for e in doc.element.body.xpath(".//w:instrText"))
+    snap["Оглавление"] = "есть" if has_toc else "нет"
+
+    text = "\n".join(p.text for p in paragraphs)
+    return {
+        "snap": snap,
+        "fingerprints": [dominant_format(doc, [p]) for p in paragraphs],
+        "text_hash": hashlib.sha1(text.encode("utf-8")).hexdigest(),
+        "chars": len(text),
+    }
+
+
+def summarize_changes(before: dict, after: dict) -> dict:
+    """
+    Сравнивает два снимка. Возвращает:
+      changed  - было ли хоть что-то изменено
+      headline - ОДНА понятная строка («Изменено: поля страницы, колонки; ...»)
+      details  - список строк «что было -> что стало»
+    """
+    labels = list(before["snap"]) + [k for k in after["snap"] if k not in before["snap"]]
+    changes = []
+    for label in labels:
+        was, now = before["snap"].get(label, "нет"), after["snap"].get(label, "нет")
+        if was != now and not (was == "нет" and now == "пустой"):  # «нет -> пустой» - не новость
+            changes.append((label, was, now))
+
+    # сколько абзацев и какие свойства изменились (если абзацы не добавлялись/не удалялись)
+    attr_counts: Counter = Counter()
+    touched = total = 0
+    paragraph_level = len(before["fingerprints"]) == len(after["fingerprints"])
+    if paragraph_level:
+        total = len(before["fingerprints"])
+        for a, b in zip(before["fingerprints"], after["fingerprints"]):
+            diff = [key for key in PARAGRAPH_ATTRS if a[key] != b[key]]
+            touched += bool(diff)
+            attr_counts.update(diff)
+
+    text_changed = before["text_hash"] != after["text_hash"]
+    page_labels = [label for label, _, _ in changes if not label.startswith(TEXT_GROUPS)]
+    if "Колонтитулы первой страницы" in page_labels:  # подпункты уже входят в этот пункт
+        page_labels = [l for l in page_labels if l == "Колонтитулы первой страницы" or "первой страницы" not in l]
+
+    pieces = []
+    if page_labels:
+        pieces.append(", ".join(label.lower() for label in page_labels))
+    if attr_counts:
+        names = ", ".join(PARAGRAPH_ATTRS[key] for key in PARAGRAPH_ATTRS if key in attr_counts)
+        pieces.append(f"оформление текста: {names} (затронуто абзацев: {touched} из {total})")
+    elif not paragraph_level:
+        group_labels = [label.lower() for label, _, _ in changes if label.startswith(TEXT_GROUPS)]
+        if group_labels:
+            pieces.append("оформление текста: " + ", ".join(group_labels))
+    if text_changed:
+        pieces.append(f"текст документа (символов было {before['chars']}, стало {after['chars']})")
+
+    details = [f"**{label}:** {was} → {now}" for label, was, now in changes]
+    if attr_counts:
+        parts = ", ".join(f"{PARAGRAPH_ATTRS[key]} — {attr_counts[key]}" for key in PARAGRAPH_ATTRS if key in attr_counts)
+        details.append(f"**Затронуто абзацев:** {touched} из {total} ({parts})")
+    if text_changed:
+        details.append(f"**Текст изменился:** символов было {before['chars']}, стало {after['chars']}")
+    else:
+        details.append("Текст документа не изменился ✓")
+
+    changed = bool(pieces)
+    headline = "Изменено: " + "; ".join(pieces) if changed else \
+        "видимых изменений не найдено (документ уже оформлен так, или команда не нашла подходящих абзацев)"
+    return {"changed": changed, "headline": headline[0].upper() + headline[1:], "details": details}
+
+
+# Пустой результат команды: «0 абз.», «0 замен(ы)», «в документе нет таблиц»
+def is_empty_result(result: str) -> bool:
+    return bool(re.search(r"(?<![\d.])0 (абз|пункт|замен)", result)) or "нет таблиц" in result
+
+
 def apply_commands(doc: Document, commands: list[dict]) -> list[str]:
+    """Применяет команды по очереди и возвращает журнал понятными фразами."""
     log = []
     for cmd in commands:
-        action = cmd.get("action")
-        handler = ACTIONS.get(action)
+        description = describe_command(cmd)
+        handler = ACTIONS.get(cmd.get("action"))
         if handler is None:
-            log.append(f"⚠️ Неизвестная команда пропущена: {action}")
+            log.append(f"⚠️ {description}")
             continue
         try:
-            log.append(f"✅ {action}: {handler(doc, cmd)}")
+            result = handler(doc, cmd)
         except Exception as exc:  # одна плохая команда не ломает остальные
-            log.append(f"❌ {action}: ошибка — {exc}")
+            log.append(f"❌ {description} — ошибка: {exc}")
+            continue
+        empty = is_empty_result(result)
+        informative = empty or re.search(r"\d+ (?:абз|пункт|замен)|таблиц|Word", result)
+        log.append(f"{'⚠️' if empty else '✅'} {description}" + (f" — {result}" if informative else ""))
     return log
 
 
@@ -1161,7 +1619,7 @@ FEATURES = [
     ("🎯", "Копируйте оформление по образцу",
      "Загрузите красиво оформленный документ: поля, шрифты, колонтитулы и заголовки перенесутся в ваш файл."),
     ("👀", "ИИ под вашим контролем",
-     "Перед применением вы видите, что именно понял ИИ, и можете поправить. Любой шаг можно отменить."),
+     "Перед применением вы видите простым языком, что именно сделает ИИ, а после — что изменилось в документе. Любой шаг можно отменить."),
     ("📑", "Сложное оформление",
      "Списки, таблицы, оглавление, разрывы страниц, замена текста, титульный лист без номера."),
     ("🔒", "Документ не уходит в ИИ целиком",
@@ -1278,6 +1736,7 @@ def init_state():
     st.session_state.setdefault("page", "home")
     st.session_state.setdefault("history", [])
     st.session_state.setdefault("steps", [])
+    st.session_state.setdefault("step_changes", [])  # описание правок для каждой версии (параллельно steps)
     st.session_state.setdefault("file_key", None)
     st.session_state.setdefault("doc_name", "document.docx")
     st.session_state.setdefault("pending_label", "")
@@ -1291,21 +1750,41 @@ def current_doc() -> Document:
     return Document(io.BytesIO(st.session_state["history"][-1]))
 
 
-def push_version(doc: Document, label: str) -> None:
+def push_version(doc: Document, label: str, summary: dict | None = None) -> None:
     buffer = io.BytesIO()
     doc.save(buffer)
-    st.session_state["history"].append(buffer.getvalue())
-    st.session_state["steps"].append(label)
-    if len(st.session_state["history"]) > MAX_HISTORY:  # первую (исходную) версию не трогаем
-        del st.session_state["history"][1]
-        del st.session_state["steps"][1]
+    state = st.session_state
+    state["history"].append(buffer.getvalue())
+    state["steps"].append(label)
+    changes = state.setdefault("step_changes", [])
+    while len(changes) < len(state["steps"]) - 1:  # выравниваем списки на случай старой сессии
+        changes.append(None)
+    changes.append(summary)
+    if len(state["history"]) > MAX_HISTORY:  # первую (исходную) версию не трогаем
+        del state["history"][1]
+        del state["steps"][1]
+        del changes[1]
 
 
 def run_commands(commands: list[dict], label: str) -> None:
     doc = current_doc()
+    try:
+        before = capture_state(doc)
+    except Exception:  # описание правок вторично: сбой в нём не должен мешать самим правкам
+        before = None
     log = apply_commands(doc, commands)
-    push_version(doc, label)
-    st.session_state["flash"] = ("success", f"Применено: {label}", log)
+    summary = None
+    if before is not None:
+        try:
+            summary = summarize_changes(before, capture_state(doc))
+        except Exception:
+            summary = None
+    push_version(doc, label, summary)
+    if summary is not None and not summary["changed"]:
+        st.session_state["flash"] = ("warning", f"Команды выполнены, но {summary['headline'][0].lower()}"
+                                                f"{summary['headline'][1:]}", log, summary)
+    else:
+        st.session_state["flash"] = ("success", f"Применено: {label}", log, summary)
 
 
 def on_preset(name: str):
@@ -1333,12 +1812,17 @@ def on_undo():
     if len(st.session_state["history"]) > 1:
         st.session_state["history"].pop()
         removed = st.session_state["steps"].pop()
-        st.session_state["flash"] = ("info", f"Отменено: {removed}", [])
+        changes = st.session_state.get("step_changes", [])
+        info = changes.pop() if len(changes) >= len(st.session_state["steps"]) + 1 else None
+        suffix = f" — {info['headline']}" if info else ""
+        st.session_state["flash"] = ("info", f"Отменено: {removed}{suffix}", [])
 
 
 def on_reset():
     del st.session_state["history"][1:]
     del st.session_state["steps"][1:]
+    if "step_changes" in st.session_state:
+        del st.session_state["step_changes"][1:]
     st.session_state.pop("pending_json", None)
     st.session_state["flash"] = ("info", "Документ возвращён к исходному виду.", [])
 
@@ -1405,11 +1889,11 @@ def render_home() -> None:
                   use_container_width=True, key="cta_top")
     html('<div class="hint">Без регистрации · шаблоны и образец работают без ИИ-ключа</div>')
 
-    html("""
+    html(f"""
     <div class="stats">
       <div class="stat"><div class="stat-num gradient-text">3</div><div class="stat-label">способа оформления</div></div>
-      <div class="stat"><div class="stat-num gradient-text">16</div><div class="stat-label">операций над документом</div></div>
-      <div class="stat"><div class="stat-num gradient-text">20</div><div class="stat-label">шагов отмены</div></div>
+      <div class="stat"><div class="stat-num gradient-text">{len(ACTIONS)}</div><div class="stat-label">операций над документом</div></div>
+      <div class="stat"><div class="stat-num gradient-text">{MAX_HISTORY}</div><div class="stat-label">шагов отмены</div></div>
     </div>
     """)
 
@@ -1470,6 +1954,7 @@ def render_editor() -> None:
                 st.stop()
             st.session_state["history"] = [uploaded.getvalue()]
             st.session_state["steps"] = ["Исходный файл"]
+            st.session_state["step_changes"] = [None]
             st.session_state["file_key"] = file_key
             st.session_state["doc_name"] = uploaded.name
             st.session_state.pop("pending_json", None)
@@ -1481,12 +1966,18 @@ def render_editor() -> None:
     # --- сообщение о результате последнего действия ---
     flash = st.session_state.pop("flash", None)
     if flash:
-        kind, text, log = flash
+        kind, text, log, *rest = flash
+        summary = rest[0] if rest else None
         getattr(st, kind)(text)
+        if summary:
+            with st.container(border=True):
+                st.markdown(f"#### 📝 Что изменилось\n**{summary['headline']}**")
+                for line in summary["details"]:
+                    st.markdown(f"- {line}")
         if log:
-            with st.expander("Что было сделано"):
+            with st.expander("Журнал выполнения команд"):
                 for line in log:
-                    st.write(line)
+                    st.markdown(line)
 
     left, right = st.columns([3, 2], gap="large")
 
@@ -1533,8 +2024,18 @@ def render_editor() -> None:
         if "pending_json" in st.session_state:
             st.divider()
             st.markdown("#### 🔍 Проверьте команды")
-            st.caption("Это то, что будет применено к документу. JSON можно отредактировать вручную.")
-            st.text_area("JSON-команды", key="pending_json", height=320, label_visibility="collapsed")
+            st.caption("Вот что будет сделано с документом. Если что-то не так, отклоните или поправьте JSON.")
+            try:
+                pending_commands = parse_commands(st.session_state.get("pending_json", ""))
+            except Exception:
+                pending_commands = None
+            if pending_commands is None:
+                st.error("JSON сейчас содержит ошибку, поэтому описание недоступно. Исправьте его ниже.")
+            else:
+                for i, pending_cmd in enumerate(pending_commands, 1):
+                    st.markdown(f"{i}. {describe_command(pending_cmd)}")
+            with st.expander("JSON-команды (для опытных пользователей)", expanded=pending_commands is None):
+                st.text_area("JSON-команды", key="pending_json", height=320, label_visibility="collapsed")
             apply_col, discard_col = st.columns(2)
             apply_col.button("✅ Применить", on_click=on_apply_pending, type="primary",
                              use_container_width=True, key="apply_pending")
@@ -1545,6 +2046,9 @@ def render_editor() -> None:
         with st.container(border=True):
             st.markdown("#### 📄 Результат")
             st.caption(f"{st.session_state['doc_name']} · версия {len(st.session_state['history'])}")
+            step_changes = st.session_state.get("step_changes", [])
+            if step_changes and step_changes[-1] and len(step_changes) == len(st.session_state["steps"]):
+                st.caption(f"Последнее изменение: {step_changes[-1]['headline']}")
             st.download_button(
                 "⬇️ Скачать документ",
                 data=st.session_state["history"][-1],
@@ -1559,8 +2063,10 @@ def render_editor() -> None:
             reset_col.button("⏮ Сбросить", on_click=on_reset, disabled=not can_undo,
                              use_container_width=True, key="reset")
         with st.expander(f"История правок ({len(st.session_state['steps'])})"):
+            step_changes = st.session_state.get("step_changes", [])
             for i, step in enumerate(st.session_state["steps"]):
-                st.write(f"{i}. {step}")
+                info = step_changes[i] if i < len(step_changes) else None
+                st.write(f"{i}. {step}" + (f" — {info['headline']}" if info else ""))
 
 
 # ---------------------------------------------------------------------------
