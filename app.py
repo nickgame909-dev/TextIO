@@ -6,13 +6,19 @@
     --> Python-функции на python-docx --> готовый .docx для скачивания
 """
 
+import base64
 import hashlib
 import io
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
 from collections import Counter
+from html import escape as esc
+from pathlib import Path
 
 import streamlit as st
 from lxml import etree
@@ -27,6 +33,9 @@ from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import nsdecls, qn
 from docx.parts.numbering import NumberingPart
 from docx.shared import Cm, Pt, RGBColor
+from docx.table import Table, _Cell
+from docx.text.paragraph import Paragraph
+from docx.text.run import Run
 from google import genai
 from google.genai import errors, types
 
@@ -1537,6 +1546,441 @@ def apply_commands(doc: Document, commands: list[dict]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 3.5 ПРЕДПРОСМОТР ДОКУМЕНТА
+# Два движка:
+#   быстрый - рисуем документ в HTML сами по данным python-docx (работает везде, без установки);
+#   точный  - LibreOffice превращает .docx в PDF, страницы показываем картинками (как в Word).
+# Дополнительно умеем находить абзацы, изменённые последним шагом, и подсвечивать их.
+# ---------------------------------------------------------------------------
+CM_TO_PX = 96 / 2.54  # CSS-пикселей в сантиметре
+MAX_PREVIEW_PAGES = 20
+MAX_INLINE_IMAGE_BYTES = 3_000_000
+
+SERIF_HINTS = ("times", "georgia", "cambria", "garamond", "book", "palatino", "minion", "serif")
+MONO_HINTS = ("courier", "consolas", "mono", "menlo")
+
+
+def css_font_family(name: str) -> str:
+    low = name.lower()
+    if any(hint in low for hint in MONO_HINTS):
+        generic = "monospace"
+    elif any(hint in low for hint in SERIF_HINTS):
+        generic = "serif"
+    else:
+        generic = "sans-serif"
+    safe = re.sub(r"[\"'\\<>;{}]", "", name)
+    return f"'{safe}',{generic}"
+
+
+def is_on(value) -> bool:
+    """True/False/None/WD_UNDERLINE -> включено ли свойство."""
+    return value not in (None, False)
+
+
+def style_size_pt(doc: Document, p) -> float | None:
+    size = _cached(doc.part, ("font", p._p.style, "size"), lambda: _font_from_styles(doc, p, "size"))
+    return size.pt if size is not None else None
+
+
+def run_css(doc: Document, run, p) -> str:
+    css = []
+    name = resolve_font_attr(doc, run, p, "name")
+    if name:
+        css.append(f"font-family:{css_font_family(str(name))}")
+    size = resolve_font_attr(doc, run, p, "size")
+    if size is not None:
+        css.append(f"font-size:{size.pt:g}pt")
+    if resolve_font_attr(doc, run, p, "bold"):
+        css.append("font-weight:bold")
+    if resolve_font_attr(doc, run, p, "italic"):
+        css.append("font-style:italic")
+    decorations = []
+    if is_on(resolve_font_attr(doc, run, p, "underline")):
+        decorations.append("underline")
+    if run.font.strike:
+        decorations.append("line-through")
+    if decorations:
+        css.append("text-decoration:" + " ".join(decorations))
+    color = resolve_font_attr(doc, run, p, "color")
+    if color is not None:
+        css.append(f"color:#{color}")
+    if run.font.superscript:
+        css.append("vertical-align:super;font-size:smaller")
+    elif run.font.subscript:
+        css.append("vertical-align:sub;font-size:smaller")
+    return ";".join(css)
+
+
+def run_html(doc: Document, run, p) -> str:
+    inner = ""
+    blips = run._r.xpath(".//a:blip/@r:embed")
+    extents = run._r.xpath(".//wp:extent")
+    for i, rid in enumerate(blips):
+        try:
+            part = doc.part.related_parts[rid]
+            if len(part.blob) > MAX_INLINE_IMAGE_BYTES:
+                raise ValueError("слишком большая картинка")
+            width = int(extents[i].get("cx")) / 9525 if i < len(extents) else 300  # EMU -> px
+            data = base64.b64encode(part.blob).decode("ascii")
+            inner += (f'<img src="data:{part.content_type};base64,{data}" '
+                      f'style="width:{width:.0f}px;max-width:100%;height:auto;vertical-align:middle">')
+        except Exception:
+            inner += '<span class="img">[изображение]</span>'
+    text = run.text
+    if text:
+        inner += esc(text).replace("\t", "&emsp;").replace("\n", "<br>")
+    if not inner:
+        return ""
+    return f'<span style="{esc(run_css(doc, run, p), quote=True)}">{inner}</span>'
+
+
+def list_info(doc: Document, p):
+    """(numId, уровень, формат) для абзаца из списка или None."""
+    ppr = p._p.pPr
+    if ppr is None or ppr.numPr is None or ppr.numPr.numId is None:
+        return None
+    num_id = ppr.numPr.numId.val
+    ilvl = ppr.numPr.ilvl.val if ppr.numPr.ilvl is not None else 0
+    if not num_id:
+        return None
+    try:
+        numbering = doc.part.numbering_part.element
+        abstract = numbering.xpath(f'w:num[@w:numId="{num_id}"]/w:abstractNumId/@w:val')
+        fmt = numbering.xpath(
+            f'w:abstractNum[@w:abstractNumId="{abstract[0]}"]/w:lvl[@w:ilvl="{ilvl}"]/w:numFmt/@w:val'
+        ) if abstract else []
+    except Exception:
+        return None
+    return num_id, ilvl, str(fmt[0]) if fmt else "decimal"
+
+
+def paragraph_html(doc: Document, p, ctx: dict) -> str:
+    css = [f"text-align:{ALIGN_NAMES.get(resolve_pf(p, 'alignment'), 'left')}"]
+    spacing = resolve_pf(p, "line_spacing")
+    if isinstance(spacing, float):
+        css.append(f"line-height:{spacing * 1.17:.2f}")  # «одинарный» в Word ~ 1.17 высоты шрифта
+    elif spacing is not None:
+        css.append(f"line-height:{spacing.pt:g}pt")
+    for prop, attr in (("margin-top", "space_before"), ("margin-bottom", "space_after")):
+        value = resolve_pf(p, attr)
+        if value is not None:
+            css.append(f"{prop}:{value.pt:g}pt")
+    left, first = resolve_pf(p, "left_indent"), resolve_pf(p, "first_line_indent")
+
+    marker = ""
+    info = list_info(doc, p)
+    if info:
+        num_id, ilvl, fmt = info
+        if fmt == "bullet":
+            marker = "•&nbsp;&nbsp;"
+        else:
+            ctx["counters"][(num_id, ilvl)] += 1
+            marker = f"{ctx['counters'][(num_id, ilvl)]}.&nbsp;&nbsp;"
+        left = left if left is not None else Cm(1.27)
+        first = first if first is not None else Cm(-0.63)
+    if left is not None:
+        css.append(f"margin-left:{left.cm:.2f}cm")
+    if first is not None:
+        css.append(f"text-indent:{first.cm:.2f}cm")
+
+    runs = []
+    for item in p.iter_inner_content():
+        for run in ([item] if isinstance(item, Run) else item.runs):
+            runs.append(run_html(doc, run, p))
+    content = "".join(runs)
+    if not content and not marker:
+        size = style_size_pt(doc, p)
+        css.append(f"min-height:{(size or 11) * 1.17:.1f}pt")
+        content = "&nbsp;"
+
+    classes = ""
+    if ctx["index"].get(p._p) in ctx["highlight"]:
+        classes = ' class="chg"'
+    html_p = f'<p{classes} style="{esc(";".join(css), quote=True)}">{marker}{content}</p>'
+    if resolve_pf(p, "page_break_before"):
+        html_p = '<div class="pb"></div>' + html_p
+    if p._p.xpath('.//w:br[@w:type="page"]'):
+        html_p += '<div class="pb"></div>'
+    return html_p
+
+
+def _vmerge(tc):
+    pr = tc.tcPr
+    vm = pr.find(qn("w:vMerge")) if pr is not None else None
+    return None if vm is None else vm.get(qn("w:val"), "continue")
+
+
+def table_html(doc: Document, table: Table, ctx: dict) -> str:
+    tbl = table._tbl
+    borders = tbl.tblPr.find(qn("w:tblBorders")) if tbl.tblPr is not None else None
+    if borders is not None:
+        bordered = any(b.get(qn("w:val")) not in ("nil", "none") for b in borders)
+    else:
+        try:
+            bordered = "grid" in (table.style.name or "").lower()
+        except Exception:
+            bordered = False
+    cell_border = "border:1px solid #000;" if bordered else ""
+    align = {WD_TABLE_ALIGNMENT.CENTER: "margin:6px auto;", WD_TABLE_ALIGNMENT.RIGHT: "margin:6px 0 6px auto;"}
+    wrapper = align.get(table.alignment, "margin:6px 0;")
+
+    rows_html = []
+    tr_list = tbl.tr_lst
+    for ri, tr in enumerate(tr_list):
+        cells = []
+        for ci, tc in enumerate(tr.tc_lst):
+            marker = _vmerge(tc)
+            if marker == "continue":
+                continue  # продолжение объединённой по вертикали ячейки
+            pr = tc.tcPr
+            gs = pr.find(qn("w:gridSpan")) if pr is not None else None
+            colspan = int(gs.get(qn("w:val"))) if gs is not None else 1
+            rowspan = 1
+            if marker == "restart":
+                for nxt in tr_list[ri + 1:]:
+                    tcs = nxt.tc_lst
+                    if ci < len(tcs) and _vmerge(tcs[ci]) == "continue":
+                        rowspan += 1
+                    else:
+                        break
+            shd = pr.find(qn("w:shd")) if pr is not None else None
+            fill = shd.get(qn("w:fill")) if shd is not None else None
+            background = f"background:#{fill};" if fill and fill.lower() != "auto" else ""
+            cell = _Cell(tc, table)
+            body = "".join(paragraph_html(doc, p, ctx) for p in cell.paragraphs) or "&nbsp;"
+            cells.append(f'<td colspan="{colspan}" rowspan="{rowspan}" '
+                         f'style="{cell_border}{background}padding:3px 6px;vertical-align:top">{body}</td>')
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+    return f'<table style="border-collapse:collapse;width:100%;{wrapper}">{"".join(rows_html)}</table>'
+
+
+def iter_body(doc: Document):
+    """Абзацы и таблицы в том порядке, в каком они стоят в документе."""
+    for child in doc.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc._body)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, doc._body)
+
+
+def header_footer_html(doc: Document, container) -> str:
+    if container.is_linked_to_previous:
+        return ""
+    lines = []
+    for p in container.paragraphs:
+        text = paragraph_text_with_fields(p).strip()
+        if not text:
+            continue
+        fmt = dominant_format(doc, [p])
+        css = [f"text-align:{fmt['align'] or 'left'}"]
+        if fmt["name"]:
+            css.append(f"font-family:{css_font_family(str(fmt['name']))}")
+        if fmt["size_pt"]:
+            css.append(f"font-size:{fmt['size_pt']:g}pt")
+        if fmt["bold"]:
+            css.append("font-weight:bold")
+        if fmt["italic"]:
+            css.append("font-style:italic")
+        if fmt["color"]:
+            css.append(f"color:#{fmt['color']}")
+        shown = esc(text).replace("{PAGE}", "1").replace("{NUMPAGES}", "N")
+        lines.append(f'<div style="{esc(";".join(css), quote=True)}">{shown}</div>')
+    return "".join(lines)
+
+
+def build_preview_html(doc: Document, highlight=()) -> str:
+    """Быстрый предпросмотр: первая страница с настоящими полями, колонками и колонтитулами."""
+    reset_format_cache(doc)
+    section = doc.sections[0]
+    page_w = section.page_width.cm if section.page_width else 21.0
+    page_h = section.page_height.cm if section.page_height else 29.7
+
+    def margin(attr: str, default: float = 2.0) -> float:
+        value = getattr(section, attr)
+        return (value.cm if value is not None else default) * CM_TO_PX
+
+    top, bottom, left, right = (margin(a) for a in ("top_margin", "bottom_margin", "left_margin", "right_margin"))
+    header_dist = margin("header_distance", 1.25)
+    footer_dist = margin("footer_distance", 1.25)
+
+    cols_count, cols_gap, cols_rule = 1, 1.25, False
+    cols = section._sectPr.find(qn("w:cols"))
+    if cols is not None:
+        cols_count = max(1, int(cols.get(qn("w:num"), 1)))
+        cols_gap = int(cols.get(qn("w:space"), 708)) / TWIPS_PER_CM
+        cols_rule = cols.get(qn("w:sep")) in ("1", "true", "on")
+
+    ctx = {
+        "highlight": set(highlight),
+        "index": {p._p: i for i, p in enumerate(all_paragraphs(doc))},
+        "counters": Counter(),
+    }
+    blocks = []
+    for block in iter_body(doc):
+        blocks.append(paragraph_html(doc, block, ctx) if isinstance(block, Paragraph) else table_html(doc, block, ctx))
+
+    first = section.different_first_page_header_footer  # на странице 1 показываем титульные колонтитулы
+    header = header_footer_html(doc, section.first_page_header if first else section.header)
+    footer = header_footer_html(doc, section.first_page_footer if first else section.footer)
+
+    column_css = ""
+    if cols_count > 1:
+        rule = "column-rule:1px solid #000;" if cols_rule else ""
+        column_css = f"column-count:{cols_count};column-gap:{cols_gap * CM_TO_PX:.0f}px;{rule}"
+
+    return f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html,body{{margin:0;background:#e6e6ec;font-family:'Times New Roman',serif}}
+.wrap{{padding:14px 8px 24px;display:flex;justify-content:center}}
+.paper{{position:relative;box-sizing:border-box;background:#fff;color:#000;width:{page_w * CM_TO_PX:.0f}px;
+min-height:{page_h * CM_TO_PX:.0f}px;padding:{top:.0f}px {right:.0f}px {bottom:.0f}px {left:.0f}px;
+box-shadow:0 2px 14px rgba(0,0,0,.28);font-size:11pt;line-height:1.17}}
+.content{{{column_css}}}
+.hdr,.ftr{{position:absolute;left:{left:.0f}px;right:{right:.0f}px}}
+.hdr{{top:{header_dist:.0f}px}} .ftr{{bottom:{footer_dist:.0f}px}}
+p{{margin:0;overflow-wrap:anywhere}}
+.pb{{border-top:2px dashed #b4b4c2;margin:16px -{left:.0f}px;position:relative;height:0}}
+.pb::after{{content:"разрыв страницы";position:absolute;right:8px;top:-9px;background:#fff;color:#8a8a99;
+font:11px sans-serif;padding:0 6px}}
+.chg{{background:#fff3b8;box-shadow:-6px 0 0 #f5b800}}
+td .chg{{background:transparent}}
+.img{{display:inline-block;border:1px dashed #999;color:#777;font:11px sans-serif;padding:2px 6px}}
+</style></head><body><div class="wrap"><div class="paper" id="paper">
+<div class="hdr">{header}</div><div class="content">{"".join(blocks)}</div><div class="ftr">{footer}</div>
+</div></div><script>
+function fit(){{var p=document.getElementById('paper');p.style.zoom=1;
+p.style.zoom=Math.min(1,(window.innerWidth-16)/p.offsetWidth)}}
+addEventListener('resize',fit);fit();
+</script></body></html>"""
+
+
+# ----- точный предпросмотр через LibreOffice ---------------------------------
+def find_soffice() -> str | None:
+    for name in ("soffice", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                 "/Applications/LibreOffice.app/Contents/MacOS/soffice"):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def pdf_renderer() -> str | None:
+    """Чем превращать PDF в картинки: PyMuPDF (pip install pymupdf) или poppler (pdftoppm)."""
+    try:
+        import fitz  # noqa: F401
+        return "fitz"
+    except ImportError:
+        return "pdftoppm" if shutil.which("pdftoppm") else None
+
+
+def accurate_preview_available() -> bool:
+    return find_soffice() is not None and pdf_renderer() is not None
+
+
+def docx_to_pdf(data: bytes) -> bytes | None:
+    soffice = find_soffice()
+    if not soffice:
+        return None
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, "doc.docx")
+        with open(src, "wb") as f:
+            f.write(data)
+        profile = Path(tmp, "profile").as_uri()  # отдельный профиль: не мешает открытому LibreOffice
+        cmd = [soffice, f"-env:UserInstallation={profile}", "--headless",
+               "--convert-to", "pdf", "--outdir", tmp, src]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        pdf = os.path.join(tmp, "doc.pdf")
+        if not os.path.exists(pdf):
+            return None
+        with open(pdf, "rb") as f:
+            return f.read()
+
+
+def pdf_to_pngs(pdf: bytes, dpi: int = 110, max_pages: int = MAX_PREVIEW_PAGES):
+    """Возвращает (список PNG-страниц, всего страниц или None) либо None, если картинки сделать нечем."""
+    engine = pdf_renderer()
+    if engine == "fitz":
+        import fitz
+        with fitz.open(stream=pdf, filetype="pdf") as doc:
+            pages = [doc[i].get_pixmap(dpi=dpi).tobytes("png") for i in range(min(len(doc), max_pages))]
+            return pages, len(doc)
+    if engine == "pdftoppm":
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "doc.pdf")
+            with open(src, "wb") as f:
+                f.write(pdf)
+            try:
+                subprocess.run(["pdftoppm", "-png", "-r", str(dpi), "-l", str(max_pages), src,
+                                os.path.join(tmp, "page")], capture_output=True, timeout=120, check=False)
+            except (subprocess.TimeoutExpired, OSError):
+                return None
+            files = sorted(f for f in os.listdir(tmp) if f.startswith("page") and f.endswith(".png"))
+            pages = []
+            for name in files:
+                with open(os.path.join(tmp, name), "rb") as f:
+                    pages.append(f.read())
+            return (pages, None) if pages else None
+    return None
+
+
+# ----- какие абзацы изменились ------------------------------------------------
+SHD_SUCCESSORS = ["w:tabs", "w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap", "w:overflowPunct",
+                  "w:topLinePunct", "w:autoSpaceDE", "w:autoSpaceDN", "w:bidi", "w:adjustRightInd",
+                  "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing", "w:mirrorIndents",
+                  "w:suppressOverlap", "w:jc", "w:textDirection", "w:textAlignment", "w:textboxTightWrap",
+                  "w:outlineLvl", "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange"]
+
+
+def paragraph_keys(doc: Document) -> list:
+    """«Отпечаток» каждого абзаца: текст, оформление, разрыв страницы, список."""
+    reset_format_cache(doc)
+    keys = []
+    for p in all_paragraphs(doc):
+        fmt = dominant_format(doc, [p])
+        in_list = p._p.pPr is not None and p._p.pPr.numPr is not None
+        keys.append((p.text, tuple(fmt.values()), bool(p.paragraph_format.page_break_before), in_list))
+    return keys
+
+
+def changed_paragraph_indexes(before: Document, after: Document) -> tuple:
+    """Номера абзацев «после», которых нет в «до» в таком же виде (изменённые или новые)."""
+    pool = Counter(paragraph_keys(before))
+    changed = []
+    for i, key in enumerate(paragraph_keys(after)):
+        if pool[key] > 0:
+            pool[key] -= 1
+        else:
+            changed.append(i)
+    return tuple(changed)
+
+
+def highlight_copy(data: bytes, indexes) -> bytes:
+    """Копия документа с жёлтой заливкой выбранных абзацев - только для точного предпросмотра."""
+    doc = Document(io.BytesIO(data))
+    paragraphs = all_paragraphs(doc)
+    for i in indexes:
+        if i >= len(paragraphs):
+            continue
+        ppr = paragraphs[i]._p.get_or_add_pPr()
+        for old in ppr.findall(qn("w:shd")):
+            ppr.remove(old)
+        shd = OxmlElement("w:shd")
+        shd.set(qn("w:val"), "clear")
+        shd.set(qn("w:color"), "auto")
+        shd.set(qn("w:fill"), "FFF3B8")
+        insert_before_any(ppr, shd, SHD_SUCCESSORS)
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # 3.2 ПРЕСЕТЫ: готовые наборы команд, ИИ не нужен
 # ---------------------------------------------------------------------------
 ALL = {"type": "all"}
@@ -1619,7 +2063,7 @@ FEATURES = [
     ("🎯", "Копируйте оформление по образцу",
      "Загрузите красиво оформленный документ: поля, шрифты, колонтитулы и заголовки перенесутся в ваш файл."),
     ("👀", "ИИ под вашим контролем",
-     "Перед применением вы видите простым языком, что именно сделает ИИ, а после — что изменилось в документе. Любой шаг можно отменить."),
+     "Перед применением вы видите простым языком, что именно сделает ИИ, а после — что изменилось в документе. Перед скачиванием можно посмотреть документ и сравнить «было → стало». Любой шаг можно отменить."),
     ("📑", "Сложное оформление",
      "Списки, таблицы, оглавление, разрывы страниц, замена текста, титульный лист без номера."),
     ("🔒", "Документ не уходит в ИИ целиком",
@@ -1932,6 +2376,97 @@ def render_home() -> None:
 # ---------------------------------------------------------------------------
 # СТРАНИЦА 2: РЕДАКТОР
 # ---------------------------------------------------------------------------
+ENGINE_ACCURATE = "Точный (как в Word)"
+ENGINE_FAST = "Быстрый (приблизительный)"
+VIEW_RESULT = "Результат"
+VIEW_COMPARE = "Было → стало"
+BASE_ORIGINAL = "с исходным файлом"
+BASE_PREVIOUS = "с предыдущим шагом"
+PREVIEW_HEIGHT = 720
+
+
+# Кэш: предпросмотр пересчитывается только при смене версии документа, а не при каждом клике
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_changed_indexes(before: bytes, after: bytes) -> tuple:
+    return changed_paragraph_indexes(Document(io.BytesIO(before)), Document(io.BytesIO(after)))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def cached_fast_preview(data: bytes, highlight: tuple) -> str:
+    return build_preview_html(Document(io.BytesIO(data)), highlight)
+
+
+@st.cache_data(show_spinner="Строю точный предпросмотр в LibreOffice (может занять до минуты)…", max_entries=8)
+def cached_accurate_preview(data: bytes, highlight: tuple):
+    if highlight:
+        data = highlight_copy(data, highlight)
+    pdf = docx_to_pdf(data)
+    return pdf_to_pngs(pdf) if pdf else None
+
+
+def show_preview(data: bytes, highlight: tuple, engine: str) -> None:
+    """Показывает одну версию документа выбранным движком; при сбое точного режима падает на быстрый."""
+    if engine == ENGINE_ACCURATE:
+        result = cached_accurate_preview(data, highlight)
+        if result and result[0]:
+            pages, total = result
+            with st.container(height=PREVIEW_HEIGHT, border=True):
+                for png in pages:
+                    st.image(png)
+            if total and total > len(pages):
+                st.caption(f"Показаны первые {len(pages)} из {total} страниц.")
+            return
+        st.warning("Не удалось построить точный предпросмотр, показан быстрый.")
+    import streamlit.components.v1 as components
+    components.html(cached_fast_preview(data, highlight), height=PREVIEW_HEIGHT, scrolling=True)
+
+
+def render_preview() -> None:
+    history = st.session_state["history"]
+    has_prev = len(history) > 1
+
+    st.divider()
+    st.markdown("#### 👁 Предпросмотр перед скачиванием")
+    st.caption("Проверьте документ глазами. Если что-то не так, отмените шаг или поправьте запрос.")
+
+    accurate = accurate_preview_available()
+    views = [VIEW_RESULT, VIEW_COMPARE] if has_prev else [VIEW_RESULT]
+    engines = [ENGINE_ACCURATE, ENGINE_FAST] if accurate else [ENGINE_FAST]
+    # после «Отменить» сохранённый выбор может пропасть из списка вариантов - сбрасываем его
+    for key, options in (("preview_view", views), ("preview_engine", engines)):
+        if st.session_state.get(key) not in options:
+            st.session_state.pop(key, None)
+    c_view, c_engine, c_hl = st.columns([2, 3, 3])
+    view = c_view.radio("Что показать", views, key="preview_view")
+    engine = c_engine.radio("Режим", engines, key="preview_engine")
+    highlight_on = has_prev and c_hl.toggle("Подсветить изменённые абзацы", value=True, key="preview_highlight")
+    if not accurate:
+        st.caption("Сейчас доступен быстрый режим: он показывает поля, колонки, колонтитулы, шрифты и таблицы, "
+                   "но переносы страниц могут отличаться от Word. Для точного режима установите LibreOffice "
+                   "и выполните `pip install pymupdf`.")
+    elif engine == ENGINE_FAST:
+        st.caption("Быстрый режим приблизителен: переносы страниц могут отличаться от Word.")
+
+    current = history[-1]
+    if view == VIEW_RESULT:
+        changed = cached_changed_indexes(history[-2], current) if highlight_on else ()
+        if highlight_on:
+            st.caption(f"🟨 Жёлтым подсвечено абзацев, изменённых последним шагом: {len(changed)}.")
+        show_preview(current, changed, engine)
+        return
+
+    base_choice = st.radio("Сравнить", [BASE_ORIGINAL, BASE_PREVIOUS], horizontal=True, key="preview_base")
+    base = history[0] if base_choice == BASE_ORIGINAL else history[-2]
+    changed = cached_changed_indexes(base, current) if highlight_on else ()
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Было**")
+        show_preview(base, (), engine)
+    with right:
+        st.markdown("**Стало**" + (f" · 🟨 изменено абзацев: {len(changed)}" if highlight_on else ""))
+        show_preview(current, changed, engine)
+
+
 def render_editor() -> None:
     back_col, title_col = st.columns([1, 4])
     back_col.button("← На главную", on_click=go, args=("home",), key="back_home")
@@ -2056,6 +2591,7 @@ def render_editor() -> None:
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 type="primary", use_container_width=True,
             )
+            st.caption("👁 Перед скачиванием посмотрите документ в предпросмотре ниже.")
             undo_col, reset_col = st.columns(2)
             can_undo = len(st.session_state["history"]) > 1
             undo_col.button("↩️ Отменить", on_click=on_undo, disabled=not can_undo,
@@ -2067,6 +2603,8 @@ def render_editor() -> None:
             for i, step in enumerate(st.session_state["steps"]):
                 info = step_changes[i] if i < len(step_changes) else None
                 st.write(f"{i}. {step}" + (f" — {info['headline']}" if info else ""))
+
+    render_preview()
 
 
 # ---------------------------------------------------------------------------
