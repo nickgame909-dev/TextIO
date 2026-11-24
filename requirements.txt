@@ -1,3 +1,5 @@
 streamlit>=1.40.0
 python-docx>=1.1.0
 google-genai>=1.0.0
+# необязательно: точный предпросмотр страниц (нужен ещё установленный LibreOffice)
+pymupdf>=1.24.0
